@@ -1,0 +1,2413 @@
+{
+  `path`: `/mnt/user-data/outputs/video-processing-pipeline-project-prompt.md`,
+  `content`: `# Video Processing Pipeline - Comprehensive Development Guide
+
+## Project Overview
+
+You are building **VideoVault** - an enterprise-grade, asynchronous, event-driven video processing platform that handles scalable video encoding, storage, and streaming. This system takes raw video uploads and processes them into multiple quality formats (1080p, 720p, 480p) for adaptive streaming delivery, similar to how YouTube, Netflix, or Vimeo handle video content.
+
+### Core Architecture Philosophy
+
+This is a **microservices-based distributed system** built on the following principles:
+- **Event-driven architecture** using Apache Kafka for asynchronous communication
+- **Service independence** - each service can be developed, deployed, and scaled independently
+- **Eventual consistency** - operations complete asynchronously with event propagation
+- **Horizontal scalability** - services can be replicated to handle increased load
+- **Fault tolerance** - system continues operating even if individual services fail
+- **Cloud-native design** - containerized with Docker, deployable to Kubernetes
+
+---
+
+## System Architecture & Data Flow
+
+### Complete Flow Diagram Explanation
+
+```
+User Upload → Middleware Service → S3 (Raw Videos) → Kafka (Uploaded Topic)
+                                                            ↓
+                                    ┌───────────────────────┼───────────────────────┐
+                                    ↓                       ↓                       ↓
+                            Encoder Service          Encoder Service         Encoder Service
+                              (1080p)                   (720p)                  (480p)
+                                    ↓                       ↓                       ↓
+                            S3 (Processed)            S3 (Processed)          S3 (Processed)
+                                    ↓                       ↓                       ↓
+                                    └───────────────────────┼───────────────────────┘
+                                                            ↓
+                                                  Kafka (Encoded Topic)
+                                                            ↓
+                                                  Metadata Service
+                                                            ↓
+                                                  PostgreSQL Database
+                                                            ↑
+                                                    (gRPC calls)
+                                                            ↑
+                                                  Streaming Service
+                                                            ↓
+                                                    End User (Video Player)
+```
+
+### Detailed Service Breakdown
+
+#### Service 1: Upload Middleware Service
+**Responsibility:** Initial point of contact for video uploads, S3 orchestration, event production
+
+**Key Functions:**
+- Accept video uploads via REST API (multipart/form-data)
+- Validate video files (format, size, duration limits)
+- Generate unique video IDs (UUID)
+- Upload raw video to S3 bucket (with proper naming convention)
+- Produce Kafka event to \"uploaded-videos\" topic with S3 location
+- Return upload confirmation with video ID to frontend
+- Handle upload progress tracking (optional: WebSocket for real-time progress)
+
+**Endpoints:**
+```
+POST /api/v1/videos/upload
+  - Accepts: multipart/form-data (video file + metadata)
+  - Returns: {videoId, status, message}
+
+GET /api/v1/videos/upload/status/{videoId}
+  - Returns: Upload progress and processing status
+```
+
+#### Service 2: Video Encoder Services (3 instances or configurable)
+**Responsibility:** Consume upload events, encode videos, produce encoded events
+
+**Key Functions:**
+- Listen to Kafka \"uploaded-videos\" topic
+- Download raw video from S3
+- Encode video using FFmpeg to specific quality (1080p/720p/480p)
+- Apply encoding best practices:
+  - H.264 codec for video (widely supported)
+  - AAC codec for audio
+  - Appropriate bitrate for each quality level
+  - Constant Rate Factor (CRF) for quality control
+  - Two-pass encoding for better compression
+- Upload encoded video to S3 (organized by quality)
+- Produce event to Kafka \"encoded-videos\" topic
+- Handle encoding failures with retry logic
+- Clean up temporary files
+
+**Encoding Specifications:**
+```
+1080p: 
+  - Resolution: 1920x1080
+  - Video Bitrate: 5000 kbps
+  - Audio Bitrate: 192 kbps
+  - CRF: 23
+
+720p:
+  - Resolution: 1280x720
+  - Video Bitrate: 2500 kbps
+  - Audio Bitrate: 128 kbps
+  - CRF: 23
+
+480p:
+  - Resolution: 854x480
+  - Video Bitrate: 1000 kbps
+  - Audio Bitrate: 96 kbps
+  - CRF: 23
+```
+
+#### Service 3: Metadata Management Service
+**Responsibility:** Central metadata repository, gRPC server for data access
+
+**Key Functions:**
+- Consume from Kafka \"encoded-videos\" topic
+- Store comprehensive video metadata in PostgreSQL:
+  - Video ID, title, description, upload timestamp
+  - Original file information (size, duration, format)
+  - Available quality levels and their S3 URLs
+  - Encoding status (pending, processing, completed, failed)
+  - User information (uploader ID)
+  - View counts, timestamps
+- Expose gRPC services for metadata operations:
+  - StoreMetadata(VideoMetadata) → Response
+  - GetVideoById(VideoId) → VideoMetadata
+  - GetVideosByUser(UserId) → List<VideoMetadata>
+  - UpdateVideoStatus(VideoId, Status) → Response
+  - ListVideos(pagination) → List<VideoMetadata>
+- Implement data validation and error handling
+- Support transactions for data consistency
+
+**Database Schema:**
+```sql
+CREATE TABLE videos (
+    video_id UUID PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    uploader_id UUID NOT NULL,
+    original_filename VARCHAR(255),
+    duration_seconds INTEGER,
+    original_size_bytes BIGINT,
+    upload_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    processing_status VARCHAR(50),
+    thumbnail_url VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE video_qualities (
+    quality_id SERIAL PRIMARY KEY,
+    video_id UUID REFERENCES videos(video_id) ON DELETE CASCADE,
+    quality_level VARCHAR(10) NOT NULL, -- '1080p', '720p', '480p'
+    s3_url VARCHAR(500) NOT NULL,
+    file_size_bytes BIGINT,
+    bitrate_kbps INTEGER,
+    encoding_status VARCHAR(50),
+    encoded_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE video_analytics (
+    analytics_id SERIAL PRIMARY KEY,
+    video_id UUID REFERENCES videos(video_id) ON DELETE CASCADE,
+    view_count BIGINT DEFAULT 0,
+    total_watch_time_seconds BIGINT DEFAULT 0,
+    last_viewed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_videos_uploader ON videos(uploader_id);
+CREATE INDEX idx_videos_status ON videos(processing_status);
+CREATE INDEX idx_qualities_video ON video_qualities(video_id);
+```
+
+#### Service 4: Streaming Service
+**Responsibility:** Video delivery to end users, adaptive bitrate streaming
+
+**Key Functions:**
+- REST API for video retrieval
+- Make gRPC calls to Metadata Service to fetch video information
+- Implement video streaming protocols:
+  - HTTP Range Requests for seeking
+  - Optional: HLS (HTTP Live Streaming) or DASH support
+- Return appropriate quality URLs based on client request
+- Track view analytics (optional)
+- Implement CDN integration (CloudFront, CloudFlare)
+- Handle authentication and authorization
+
+**Endpoints:**
+```
+GET /api/v1/stream/videos
+  - Returns: List of available videos with metadata
+
+GET /api/v1/stream/videos/{videoId}
+  - Returns: Video metadata with available quality URLs
+
+GET /api/v1/stream/videos/{videoId}/play?quality=720p
+  - Returns: Streaming URL or redirects to S3/CDN
+
+GET /api/v1/stream/videos/{videoId}/thumbnail
+  - Returns: Thumbnail image
+```
+
+---
+
+## Technology Stack Details
+
+### Backend Technologies
+
+#### Spring Boot Framework
+- **Version:** Spring Boot 3.x with Java 17 or 21
+- **Why:** Production-grade, enterprise-ready, excellent ecosystem
+- **Dependencies to include:**
+  - spring-boot-starter-web (REST APIs)
+  - spring-boot-starter-data-jpa (Database access)
+  - spring-boot-starter-validation (Input validation)
+  - spring-boot-starter-actuator (Health checks, metrics)
+  - spring-kafka (Kafka integration)
+  - grpc-spring-boot-starter (gRPC support)
+
+#### Apache Kafka
+- **Version:** 3.x
+- **Purpose:** Event streaming backbone
+- **Topics to create:**
+  - `uploaded-videos` - Raw video upload events
+  - `encoded-videos` - Completed encoding events
+  - `encoding-failed` - Failed encoding events (for monitoring)
+- **Configuration Best Practices:**
+  - Replication factor: 3 (for production)
+  - Partitions: Based on expected load (start with 3-6 per topic)
+  - Retention: 7 days for event replay capability
+  - Compression: Enable snappy or lz4
+  - Idempotent producers to prevent duplicates
+  - Consumer groups for parallel processing
+
+#### gRPC
+- **Version:** Latest stable
+- **Purpose:** Fast, efficient service-to-service communication
+- **Protocol Buffer Definitions (.proto files):**
+
+```protobuf
+syntax = \"proto3\";
+
+package videoservice;
+
+service MetadataService {
+  rpc StoreMetadata(VideoMetadata) returns (MetadataResponse);
+  rpc GetVideoById(VideoIdRequest) returns (VideoMetadata);
+  rpc GetVideosByUser(UserIdRequest) returns (VideoList);
+  rpc UpdateVideoStatus(StatusUpdate) returns (MetadataResponse);
+  rpc ListVideos(PaginationRequest) returns (VideoList);
+}
+
+message VideoMetadata {
+  string video_id = 1;
+  string title = 2;
+  string description = 3;
+  string uploader_id = 4;
+  int64 duration_seconds = 5;
+  int64 original_size_bytes = 6;
+  string processing_status = 7;
+  repeated QualityInfo available_qualities = 8;
+  string thumbnail_url = 9;
+  int64 upload_timestamp = 10;
+}
+
+message QualityInfo {
+  string quality_level = 1;
+  string s3_url = 2;
+  int64 file_size_bytes = 3;
+  int32 bitrate_kbps = 4;
+}
+
+message VideoIdRequest {
+  string video_id = 1;
+}
+
+message UserIdRequest {
+  string user_id = 1;
+}
+
+message StatusUpdate {
+  string video_id = 1;
+  string status = 2;
+}
+
+message PaginationRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+}
+
+message VideoList {
+  repeated VideoMetadata videos = 1;
+  int32 total_count = 2;
+}
+
+message MetadataResponse {
+  bool success = 1;
+  string message = 2;
+}
+```
+
+#### PostgreSQL
+- **Version:** 14 or later
+- **Purpose:** Persistent metadata storage
+- **Configuration:**
+  - Enable connection pooling (HikariCP)
+  - Set appropriate indexes for query optimization
+  - Configure regular backups
+  - Use prepared statements to prevent SQL injection
+
+#### Amazon S3 (or S3-compatible storage)
+- **Purpose:** Object storage for video files
+- **Bucket Structure:**
+```
+video-storage-bucket/
+├── raw/
+│   └── {video-id}/
+│       └── original.{ext}
+├── processed/
+│   └── {video-id}/
+│       ├── 1080p.mp4
+│       ├── 720p.mp4
+│       └── 480p.mp4
+└── thumbnails/
+    └── {video-id}/
+        └── thumbnail.jpg
+```
+- **Best Practices:**
+  - Use lifecycle policies to move old content to cheaper storage tiers
+  - Enable versioning for important buckets
+  - Set CORS policies for frontend access
+  - Use presigned URLs for secure, temporary access
+  - Implement server-side encryption
+
+#### Docker
+- **Purpose:** Containerization for consistency and deployment
+- **Requirements:**
+  - Dockerfile for each service
+  - Docker Compose for local development
+  - Multi-stage builds for optimized images
+  - Health checks in containers
+
+### Frontend Technologies
+
+#### Next.js
+- **Version:** 14.x with App Router
+- **Features to implement:**
+  - File upload with progress tracking
+  - Video listing with pagination
+  - Video player with quality selection
+  - Responsive design
+  - Server-side rendering for SEO
+
+#### Key Pages/Components:
+
+**1. Upload Page (`/upload`)**
+```jsx
+Components needed:
+- FileUploadDropzone (drag-and-drop support)
+- UploadProgressBar
+- VideoPreview (before upload)
+- MetadataForm (title, description)
+- UploadStatusTracker
+```
+
+**2. Videos Library Page (`/videos`)**
+```jsx
+Components needed:
+- VideoGrid/VideoList
+- SearchBar
+- FilterOptions (by date, quality, status)
+- Pagination
+- VideoCard (thumbnail, title, duration, upload date)
+```
+
+**3. Video Player Page (`/watch/{videoId}`)**
+```jsx
+Components needed:
+- VideoPlayer (HTML5 with custom controls)
+- QualitySelector
+- VideoInfo (title, description, views)
+- RelatedVideos (optional)
+- CommentSection (optional)
+```
+
+---
+
+## Project Structure & Organization
+
+### Monorepo vs Polyrepo Decision
+**Recommendation:** Start with a **monorepo** for easier development, then split if needed.
+
+### Directory Structure
+
+```
+videovault/
+├── README.md
+├── docker-compose.yml
+├── .gitignore
+├── docs/
+│   ├── architecture.md
+│   ├── api-documentation.md
+│   ├── deployment-guide.md
+│   └── development-setup.md
+│
+├── backend/
+│   ├── shared/
+│   │   ├── proto/
+│   │   │   └── video-metadata.proto
+│   │   ├── common-models/
+│   │   └── common-utils/
+│   │
+│   ├── upload-service/
+│   │   ├── src/
+│   │   │   ├── main/
+│   │   │   │   ├── java/
+│   │   │   │   │   └── com/videovault/upload/
+│   │   │   │   │       ├── UploadServiceApplication.java
+│   │   │   │   │       ├── config/
+│   │   │   │   │       │   ├── S3Config.java
+│   │   │   │   │       │   ├── KafkaProducerConfig.java
+│   │   │   │   │       │   └── SecurityConfig.java
+│   │   │   │   │       ├── controller/
+│   │   │   │   │       │   └── UploadController.java
+│   │   │   │   │       ├── service/
+│   │   │   │   │       │   ├── UploadService.java
+│   │   │   │   │       │   ├── S3Service.java
+│   │   │   │   │       │   └── KafkaProducerService.java
+│   │   │   │   │       ├── model/
+│   │   │   │   │       │   ├── UploadRequest.java
+│   │   │   │   │       │   ├── UploadResponse.java
+│   │   │   │   │       │   └── VideoUploadEvent.java
+│   │   │   │   │       ├── exception/
+│   │   │   │   │       │   ├── GlobalExceptionHandler.java
+│   │   │   │   │       │   └── UploadException.java
+│   │   │   │   │       └── util/
+│   │   │   │   │           ├── FileValidator.java
+│   │   │   │   │           └── VideoIdGenerator.java
+│   │   │   │   └── resources/
+│   │   │   │       ├── application.yml
+│   │   │   │       ├── application-dev.yml
+│   │   │   │       └── application-prod.yml
+│   │   │   └── test/
+│   │   │       └── java/
+│   │   │           └── com/videovault/upload/
+│   │   │               ├── UploadServiceTests.java
+│   │   │               └── S3ServiceTests.java
+│   │   ├── Dockerfile
+│   │   ├── pom.xml
+│   │   └── README.md
+│   │
+│   ├── encoder-service/
+│   │   ├── src/
+│   │   │   ├── main/
+│   │   │   │   ├── java/
+│   │   │   │   │   └── com/videovault/encoder/
+│   │   │   │   │       ├── EncoderServiceApplication.java
+│   │   │   │   │       ├── config/
+│   │   │   │   │       │   ├── KafkaConsumerConfig.java
+│   │   │   │   │       │   ├── KafkaProducerConfig.java
+│   │   │   │   │       │   └── EncoderConfig.java
+│   │   │   │   │       ├── consumer/
+│   │   │   │   │       │   └── VideoUploadConsumer.java
+│   │   │   │   │       ├── service/
+│   │   │   │   │       │   ├── EncodingService.java
+│   │   │   │   │       │   ├── FFmpegService.java
+│   │   │   │   │       │   ├── S3DownloadService.java
+│   │   │   │   │       │   ├── S3UploadService.java
+│   │   │   │   │       │   └── KafkaProducerService.java
+│   │   │   │   │       ├── model/
+│   │   │   │   │       │   ├── VideoUploadEvent.java
+│   │   │   │   │       │   ├── VideoEncodedEvent.java
+│   │   │   │   │       │   └── EncodingConfig.java
+│   │   │   │   │       ├── exception/
+│   │   │   │   │       │   └── EncodingException.java
+│   │   │   │   │       └── util/
+│   │   │   │   │           ├── FFmpegCommandBuilder.java
+│   │   │   │   │           └── TempFileManager.java
+│   │   │   │   └── resources/
+│   │   │   │       ├── application.yml
+│   │   │   │       └── encoding-profiles.yml
+│   │   │   └── test/
+│   │   ├── Dockerfile
+│   │   ├── pom.xml
+│   │   └── README.md
+│   │
+│   ├── metadata-service/
+│   │   ├── src/
+│   │   │   ├── main/
+│   │   │   │   ├── java/
+│   │   │   │   │   └── com/videovault/metadata/
+│   │   │   │   │       ├── MetadataServiceApplication.java
+│   │   │   │   │       ├── config/
+│   │   │   │   │       │   ├── DatabaseConfig.java
+│   │   │   │   │       │   ├── GrpcServerConfig.java
+│   │   │   │   │       │   └── KafkaConsumerConfig.java
+│   │   │   │   │       ├── consumer/
+│   │   │   │   │       │   └── VideoEncodedConsumer.java
+│   │   │   │   │       ├── grpc/
+│   │   │   │   │       │   └── MetadataServiceImpl.java
+│   │   │   │   │       ├── service/
+│   │   │   │   │       │   └── MetadataService.java
+│   │   │   │   │       ├── repository/
+│   │   │   │   │       │   ├── VideoRepository.java
+│   │   │   │   │       │   ├── VideoQualityRepository.java
+│   │   │   │   │       │   └── VideoAnalyticsRepository.java
+│   │   │   │   │       ├── entity/
+│   │   │   │   │       │   ├── Video.java
+│   │   │   │   │       │   ├── VideoQuality.java
+│   │   │   │   │       │   └── VideoAnalytics.java
+│   │   │   │   │       ├── mapper/
+│   │   │   │   │       │   └── VideoMetadataMapper.java
+│   │   │   │   │       └── exception/
+│   │   │   │   │           └── MetadataException.java
+│   │   │   │   └── resources/
+│   │   │   │       ├── application.yml
+│   │   │   │       └── db/
+│   │   │   │           └── migration/
+│   │   │   │               ├── V1__create_videos_table.sql
+│   │   │   │               ├── V2__create_video_qualities_table.sql
+│   │   │   │               └── V3__create_video_analytics_table.sql
+│   │   │   └── test/
+│   │   ├── Dockerfile
+│   │   ├── pom.xml
+│   │   └── README.md
+│   │
+│   └── streaming-service/
+│       ├── src/
+│       │   ├── main/
+│       │   │   ├── java/
+│       │   │   │   └── com/videovault/streaming/
+│       │   │   │       ├── StreamingServiceApplication.java
+│       │   │   │       ├── config/
+│       │   │   │       │   ├── GrpcClientConfig.java
+│       │   │   │       │   ├── CdnConfig.java
+│       │   │   │       │   └── CorsConfig.java
+│       │   │   │       ├── controller/
+│       │   │   │       │   └── StreamingController.java
+│       │   │   │       ├── service/
+│       │   │   │       │   ├── StreamingService.java
+│       │   │   │       │   ├── MetadataGrpcClient.java
+│       │   │   │       │   └── UrlGeneratorService.java
+│       │   │   │       ├── model/
+│       │   │   │       │   ├── VideoResponse.java
+│       │   │   │       │   └── StreamingUrl.java
+│       │   │   │       └── exception/
+│       │   │   │           └── StreamingException.java
+│       │   │   └── resources/
+│       │   │       └── application.yml
+│       │   └── test/
+│       ├── Dockerfile
+│       ├── pom.xml
+│       └── README.md
+│
+├── frontend/
+│   ├── videovault-web/
+│   │   ├── public/
+│   │   │   ├── icons/
+│   │   │   └── images/
+│   │   ├── src/
+│   │   │   ├── app/
+│   │   │   │   ├── layout.tsx
+│   │   │   │   ├── page.tsx
+│   │   │   │   ├── upload/
+│   │   │   │   │   └── page.tsx
+│   │   │   │   ├── videos/
+│   │   │   │   │   └── page.tsx
+│   │   │   │   └── watch/
+│   │   │   │       └── [videoId]/
+│   │   │   │           └── page.tsx
+│   │   │   ├── components/
+│   │   │   │   ├── upload/
+│   │   │   │   │   ├── FileUploadZone.tsx
+│   │   │   │   │   ├── UploadProgress.tsx
+│   │   │   │   │   └── MetadataForm.tsx
+│   │   │   │   ├── video/
+│   │   │   │   │   ├── VideoCard.tsx
+│   │   │   │   │   ├── VideoGrid.tsx
+│   │   │   │   │   ├── VideoPlayer.tsx
+│   │   │   │   │   └── QualitySelector.tsx
+│   │   │   │   ├── common/
+│   │   │   │   │   ├── Header.tsx
+│   │   │   │   │   ├── Footer.tsx
+│   │   │   │   │   └── Loading.tsx
+│   │   │   │   └── ui/
+│   │   │   │       └── (shadcn components)
+│   │   │   ├── lib/
+│   │   │   │   ├── api/
+│   │   │   │   │   ├── upload.ts
+│   │   │   │   │   ├── videos.ts
+│   │   │   │   │   └── streaming.ts
+│   │   │   │   ├── hooks/
+│   │   │   │   │   ├── useUpload.ts
+│   │   │   │   │   ├── useVideos.ts
+│   │   │   │   │   └── useVideoPlayer.ts
+│   │   │   │   └── utils/
+│   │   │   │       ├── formatters.ts
+│   │   │   │       └── validators.ts
+│   │   │   ├── types/
+│   │   │   │   ├── video.ts
+│   │   │   │   └── api.ts
+│   │   │   └── styles/
+│   │   │       └── globals.css
+│   │   ├── .env.local
+│   │   ├── .env.production
+│   │   ├── next.config.js
+│   │   ├── package.json
+│   │   ├── tsconfig.json
+│   │   ├── Dockerfile
+│   │   └── README.md
+│   │
+│   └── mobile/ (optional - future)
+│
+├── infrastructure/
+│   ├── kubernetes/
+│   │   ├── namespaces/
+│   │   ├── deployments/
+│   │   ├── services/
+│   │   ├── configmaps/
+│   │   └── secrets/
+│   ├── terraform/
+│   │   ├── aws/
+│   │   └── modules/
+│   └── monitoring/
+│       ├── prometheus/
+│       └── grafana/
+│
+└── scripts/
+    ├── setup-local-env.sh
+    ├── build-all-services.sh
+    ├── deploy-services.sh
+    └── run-integration-tests.sh
+```
+
+---
+
+## Industry Best Practices to Follow
+
+### 1. Code Quality & Standards
+
+#### Java/Spring Boot Best Practices
+- **Follow SOLID principles**
+- **Use dependency injection** - Let Spring manage your beans
+- **Separate concerns** - Controller → Service → Repository pattern
+- **Use DTOs** - Don't expose entities directly in APIs
+- **Implement proper exception handling** - Use @ControllerAdvice for global exception handling
+- **Use Lombok** - Reduce boilerplate with @Data, @Builder, @Slf4j
+- **Write meaningful logs** - Use SLF4J with structured logging
+- **Configuration externalization** - Use application.yml and environment variables
+- **API versioning** - Include /api/v1/ in all endpoints
+- **Input validation** - Use @Valid and @Validated with Bean Validation
+- **Use profiles** - dev, test, prod profiles for different environments
+
+#### Example Controller Pattern:
+```java
+@RestController
+@RequestMapping(\"/api/v1/videos\")
+@Slf4j
+@RequiredArgsConstructor
+public class UploadController {
+    
+    private final UploadService uploadService;
+    
+    @PostMapping(\"/upload\")
+    public ResponseEntity<UploadResponse> uploadVideo(
+            @Valid @RequestParam(\"file\") MultipartFile file,
+            @Valid @ModelAttribute VideoMetadataRequest metadata) {
+        
+        log.info(\"Received upload request for video: {}\", metadata.getTitle());
+        
+        try {
+            UploadResponse response = uploadService.processUpload(file, metadata);
+            return ResponseEntity.ok(response);
+        } catch (InvalidFileException e) {
+            log.error(\"Invalid file upload: {}\", e.getMessage());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+    }
+}
+```
+
+#### Example Service Pattern:
+```java
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class UploadService {
+    
+    private final S3Service s3Service;
+    private final KafkaProducerService kafkaProducerService;
+    private final VideoValidator videoValidator;
+    
+    @Transactional
+    public UploadResponse processUpload(MultipartFile file, VideoMetadataRequest metadata) {
+        // Validate
+        videoValidator.validate(file);
+        
+        // Generate unique ID
+        String videoId = UUID.randomUUID().toString();
+        
+        // Upload to S3
+        String s3Url = s3Service.uploadRawVideo(videoId, file);
+        log.info(\"Video uploaded to S3: {}\", s3Url);
+        
+        // Produce Kafka event
+        VideoUploadEvent event = VideoUploadEvent.builder()
+                .videoId(videoId)
+                .s3Url(s3Url)
+                .originalFilename(file.getOriginalFilename())
+                .fileSize(file.getSize())
+                .build();
+        
+        kafkaProducerService.sendUploadEvent(event);
+        log.info(\"Upload event produced for video: {}\", videoId);
+        
+        return UploadResponse.builder()
+                .videoId(videoId)
+                .status(\"UPLOADED\")
+                .message(\"Video uploaded successfully\")
+                .build();
+    }
+}
+```
+
+### 2. Kafka Best Practices
+
+#### Producer Configuration
+```java
+@Configuration
+public class KafkaProducerConfig {
+    
+    @Bean
+    public ProducerFactory<String, VideoUploadEvent> producerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        
+        // Reliability settings
+        config.put(ProducerConfig.ACKS_CONFIG, \"all\"); // Wait for all replicas
+        config.put(ProducerConfig.RETRIES_CONFIG, 3); // Retry failed sends
+        config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true); // Prevent duplicates
+        
+        // Performance settings
+        config.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, \"snappy\");
+        config.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
+        config.put(ProducerConfig.LINGER_MS_CONFIG, 10);
+        
+        return new DefaultKafkaProducerFactory<>(config);
+    }
+}
+```
+
+#### Consumer Configuration
+```java
+@Configuration
+public class KafkaConsumerConfig {
+    
+    @Bean
+    public ConsumerFactory<String, VideoUploadEvent> consumerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
+        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        config.put(ConsumerConfig.GROUP_ID_CONFIG, \"encoder-service-group\");
+        
+        // Reliability settings
+        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false); // Manual commit
+        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, \"earliest\");
+        config.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1); // Process one at a time for long-running tasks
+        
+        // Deserialization settings
+        config.put(JsonDeserializer.TRUSTED_PACKAGES, \"com.videovault.*\");
+        config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, VideoUploadEvent.class);
+        
+        return new DefaultKafkaConsumerFactory<>(config);
+    }
+}
+```
+
+#### Consumer Implementation with Error Handling
+```java
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class VideoUploadConsumer {
+    
+    private final EncodingService encodingService;
+    
+    @KafkaListener(topics = \"uploaded-videos\", groupId = \"encoder-service-group\")
+    public void consume(
+            @Payload VideoUploadEvent event,
+            @Header(KafkaHeaders.RECEIVED_PARTITION_ID) int partition,
+            Acknowledgment acknowledgment) {
+        
+        log.info(\"Received video upload event: videoId={}, partition={}\", 
+                event.getVideoId(), partition);
+        
+        try {
+            // Process the video
+            encodingService.encodeVideo(event);
+            
+            // Manually commit offset only after successful processing
+            acknowledgment.acknowledge();
+            log.info(\"Successfully processed video: {}\", event.getVideoId());
+            
+        } catch (Exception e) {
+            log.error(\"Failed to process video: {}\", event.getVideoId(), e);
+            // Don't acknowledge - message will be redelivered
+            // Consider implementing Dead Letter Queue (DLQ) after max retries
+        }
+    }
+}
+```
+
+### 3. FFmpeg Integration Best Practices
+
+#### FFmpeg Service Implementation
+```java
+@Service
+@Slf4j
+public class FFmpegService {
+    
+    public void encodeVideo(String inputPath, String outputPath, EncodingProfile profile) {
+        List<String> command = buildFFmpegCommand(inputPath, outputPath, profile);
+        
+        try {
+            ProcessBuilder processBuilder = new ProcessBuilder(command);
+            processBuilder.redirectErrorStream(true);
+            
+            Process process = processBuilder.start();
+            
+            // Monitor progress
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    log.debug(\"FFmpeg output: {}\", line);
+                    // Parse progress from FFmpeg output if needed
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            
+            if (exitCode != 0) {
+                throw new EncodingException(\"FFmpeg encoding failed with exit code: \" + exitCode);
+            }
+            
+            log.info(\"Video encoded successfully: {}\", outputPath);
+            
+        } catch (IOException | InterruptedException e) {
+            log.error(\"Error during video encoding\", e);
+            throw new EncodingException(\"Video encoding failed\", e);
+        }
+    }
+    
+    private List<String> buildFFmpegCommand(String input, String output, EncodingProfile profile) {
+        List<String> command = new ArrayList<>();
+        command.add(\"ffmpeg\");
+        command.add(\"-i\");
+        command.add(input);
+        
+        // Video codec settings
+        command.add(\"-c:v\");
+        command.add(\"libx264\");
+        command.add(\"-preset\");
+        command.add(\"medium\"); // balance between speed and quality
+        command.add(\"-crf\");
+        command.add(String.valueOf(profile.getCrf()));
+        
+        // Resolution and bitrate
+        command.add(\"-vf\");
+        command.add(String.format(\"scale=%d:%d\", profile.getWidth(), profile.getHeight()));
+        command.add(\"-b:v\");
+        command.add(profile.getVideoBitrate());
+        command.add(\"-maxrate\");
+        command.add(profile.getMaxBitrate());
+        command.add(\"-bufsize\");
+        command.add(profile.getBufferSize());
+        
+        // Audio codec settings
+        command.add(\"-c:a\");
+        command.add(\"aac\");
+        command.add(\"-b:a\");
+        command.add(profile.getAudioBitrate());
+        command.add(\"-ar\");
+        command.add(\"48000\"); // Sample rate
+        
+        // Format settings
+        command.add(\"-movflags\");
+        command.add(\"+faststart\"); // Enable progressive download
+        command.add(\"-f\");
+        command.add(\"mp4\");
+        
+        command.add(output);
+        
+        return command;
+    }
+}
+```
+
+#### Encoding Profile Configuration
+```java
+@Configuration
+@ConfigurationProperties(prefix = \"encoding\")
+@Data
+public class EncodingConfig {
+    private Map<String, EncodingProfile> profiles;
+}
+
+@Data
+@Builder
+public class EncodingProfile {
+    private String quality;
+    private int width;
+    private int height;
+    private String videoBitrate;
+    private String maxBitrate;
+    private String bufferSize;
+    private String audioBitrate;
+    private int crf;
+}
+```
+
+```yaml
+# application.yml
+encoding:
+  profiles:
+    1080p:
+      quality: \"1080p\"
+      width: 1920
+      height: 1080
+      video-bitrate: \"5000k\"
+      max-bitrate: \"5350k\"
+      buffer-size: \"7500k\"
+      audio-bitrate: \"192k\"
+      crf: 23
+    720p:
+      quality: \"720p\"
+      width: 1280
+      height: 720
+      video-bitrate: \"2500k\"
+      max-bitrate: \"2675k\"
+      buffer-size: \"3750k\"
+      audio-bitrate: \"128k\"
+      crf: 23
+    480p:
+      quality: \"480p\"
+      width: 854
+      height: 480
+      video-bitrate: \"1000k\"
+      max-bitrate: \"1070k\"
+      buffer-size: \"1500k\"
+      audio-bitrate: \"96k\"
+      crf: 23
+```
+
+### 4. gRPC Implementation Best Practices
+
+#### Server Implementation
+```java
+@GrpcService
+@Slf4j
+@RequiredArgsConstructor
+public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImplBase {
+    
+    private final MetadataService metadataService;
+    private final VideoMetadataMapper mapper;
+    
+    @Override
+    public void storeMetadata(VideoMetadataProto.VideoMetadata request,
+                            StreamObserver<VideoMetadataProto.MetadataResponse> responseObserver) {
+        try {
+            log.info(\"Received store metadata request for video: {}\", request.getVideoId());
+            
+            Video video = mapper.toEntity(request);
+            metadataService.saveMetadata(video);
+            
+            VideoMetadataProto.MetadataResponse response = VideoMetadataProto.MetadataResponse
+                    .newBuilder()
+                    .setSuccess(true)
+                    .setMessage(\"Metadata stored successfully\")
+                    .build();
+            
+            responseObserver.onNext(response);
+            responseObserver.onCompleted();
+            
+        } catch (Exception e) {
+            log.error(\"Error storing metadata\", e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(\"Failed to store metadata: \" + e.getMessage())
+                    .asRuntimeException());
+        }
+    }
+    
+    @Override
+    public void getVideoById(VideoMetadataProto.VideoIdRequest request,
+                           StreamObserver<VideoMetadataProto.VideoMetadata> responseObserver) {
+        try {
+            String videoId = request.getVideoId();
+            log.info(\"Received get video request: {}\", videoId);
+            
+            Video video = metadataService.getVideoById(videoId)
+                    .orElseThrow(() -> new VideoNotFoundException(\"Video not found: \" + videoId));
+            
+            VideoMetadataProto.VideoMetadata response = mapper.toProto(video);
+            
+            responseObserver.onNext(response);
+            responseObserver.onCompleted();
+            
+        } catch (VideoNotFoundException e) {
+            log.error(\"Video not found\", e);
+            responseObserver.onError(Status.NOT_FOUND
+                    .withDescription(e.getMessage())
+                    .asRuntimeException());
+        } catch (Exception e) {
+            log.error(\"Error retrieving video\", e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(\"Failed to retrieve video\")
+                    .asRuntimeException());
+        }
+    }
+}
+```
+
+#### Client Implementation
+```java
+@Service
+@Slf4j
+public class MetadataGrpcClient {
+    
+    private final MetadataServiceGrpc.MetadataServiceBlockingStub blockingStub;
+    
+    public MetadataGrpcClient(
+            @Value(\"${grpc.metadata-service.host}\") String host,
+            @Value(\"${grpc.metadata-service.port}\") int port) {
+        
+        ManagedChannel channel = ManagedChannelBuilder
+                .forAddress(host, port)
+                .usePlaintext() // Use TLS in production
+                .build();
+        
+        this.blockingStub = MetadataServiceGrpc.newBlockingStub(channel);
+    }
+    
+    public VideoMetadata getVideoById(String videoId) {
+        try {
+            VideoMetadataProto.VideoIdRequest request = VideoMetadataProto.VideoIdRequest
+                    .newBuilder()
+                    .setVideoId(videoId)
+                    .build();
+            
+            VideoMetadataProto.VideoMetadata response = blockingStub.getVideoById(request);
+            
+            return mapToVideoMetadata(response);
+            
+        } catch (StatusRuntimeException e) {
+            log.error(\"gRPC call failed: {}\", e.getStatus(), e);
+            throw new MetadataServiceException(\"Failed to fetch video metadata\", e);
+        }
+    }
+}
+```
+
+### 5. Docker & Containerization Best Practices
+
+#### Multi-Stage Dockerfile for Spring Boot
+```dockerfile
+# Build stage
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /app
+
+# Copy pom.xml and download dependencies (cached layer)
+COPY pom.xml .
+RUN mvn dependency:go-offline -B
+
+# Copy source and build
+COPY src ./src
+RUN mvn clean package -DskipTests
+
+# Runtime stage
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+
+# Install FFmpeg (for encoder service only)
+RUN apk add --no-cache ffmpeg
+
+# Create non-root user
+RUN addgroup -g 1001 -S appuser && \\
+    adduser -u 1001 -S appuser -G appuser
+
+# Copy JAR from build stage
+COPY --from=build /app/target/*.jar app.jar
+
+# Change ownership
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \\
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+
+# Expose port
+EXPOSE 8080
+
+# Run application
+ENTRYPOINT [\"java\", \"-XX:+UseContainerSupport\", \"-XX:MaxRAMPercentage=75.0\", \"-jar\", \"app.jar\"]
+```
+
+#### Docker Compose for Local Development
+```yaml
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - \"2181:2181\"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - \"9092:9092\"
+      - \"9093:9093\"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: videovault
+      POSTGRES_USER: videovault_user
+      POSTGRES_PASSWORD: videovault_pass
+    ports:
+      - \"5432:5432\"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [\"CMD-SHELL\", \"pg_isready -U videovault_user\"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - \"4566:4566\"
+    environment:
+      SERVICES: s3
+      DEBUG: 1
+      DATA_DIR: /tmp/localstack/data
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack-data:/tmp/localstack
+      - ./scripts/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh
+
+  upload-service:
+    build:
+      context: ./backend/upload-service
+      dockerfile: Dockerfile
+    ports:
+      - \"8081:8080\"
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AWS_S3_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      - kafka
+      - localstack
+    restart: on-failure
+
+  encoder-service:
+    build:
+      context: ./backend/encoder-service
+      dockerfile: Dockerfile
+    deploy:
+      replicas: 3  # Run 3 instances for parallel encoding
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AWS_S3_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      ENCODING_QUALITY: ${ENCODING_QUALITY}  # Set via env for each replica
+    depends_on:
+      - kafka
+      - localstack
+    restart: on-failure
+
+  metadata-service:
+    build:
+      context: ./backend/metadata-service
+      dockerfile: Dockerfile
+    ports:
+      - \"8082:8080\"
+      - \"9090:9090\"  # gRPC port
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/videovault
+      SPRING_DATASOURCE_USERNAME: videovault_user
+      SPRING_DATASOURCE_PASSWORD: videovault_pass
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      GRPC_SERVER_PORT: 9090
+    depends_on:
+      - kafka
+      - postgres
+    restart: on-failure
+
+  streaming-service:
+    build:
+      context: ./backend/streaming-service
+      dockerfile: Dockerfile
+    ports:
+      - \"8083:8080\"
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      GRPC_METADATA_SERVICE_HOST: metadata-service
+      GRPC_METADATA_SERVICE_PORT: 9090
+      AWS_S3_ENDPOINT: http://localstack:4566
+    depends_on:
+      - metadata-service
+      - localstack
+    restart: on-failure
+
+  frontend:
+    build:
+      context: ./frontend/videovault-web
+      dockerfile: Dockerfile
+    ports:
+      - \"3000:3000\"
+    environment:
+      NEXT_PUBLIC_UPLOAD_API_URL: http://localhost:8081/api/v1
+      NEXT_PUBLIC_STREAMING_API_URL: http://localhost:8083/api/v1
+    depends_on:
+      - upload-service
+      - streaming-service
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  postgres-data:
+  localstack-data:
+
+networks:
+  default:
+    name: videovault-network
+```
+
+### 6. Database Best Practices
+
+#### JPA Entity Example
+```java
+@Entity
+@Table(name = \"videos\", indexes = {
+    @Index(name = \"idx_uploader\", columnList = \"uploader_id\"),
+    @Index(name = \"idx_status\", columnList = \"processing_status\")
+})
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Video {
+    
+    @Id
+    @Column(name = \"video_id\", length = 36)
+    private String videoId;
+    
+    @Column(nullable = false, length = 255)
+    private String title;
+    
+    @Column(columnDefinition = \"TEXT\")
+    private String description;
+    
+    @Column(name = \"uploader_id\", nullable = false, length = 36)
+    private String uploaderId;
+    
+    @Column(name = \"original_filename\", length = 255)
+    private String originalFilename;
+    
+    @Column(name = \"duration_seconds\")
+    private Integer durationSeconds;
+    
+    @Column(name = \"original_size_bytes\")
+    private Long originalSizeBytes;
+    
+    @Column(name = \"processing_status\", length = 50)
+    @Enumerated(EnumType.STRING)
+    private ProcessingStatus processingStatus;
+    
+    @Column(name = \"thumbnail_url\", length = 500)
+    private String thumbnailUrl;
+    
+    @OneToMany(mappedBy = \"video\", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<VideoQuality> qualities = new ArrayList<>();
+    
+    @OneToOne(mappedBy = \"video\", cascade = CascadeType.ALL, orphanRemoval = true)
+    private VideoAnalytics analytics;
+    
+    @Column(name = \"created_at\", nullable = false, updatable = false)
+    @CreationTimestamp
+    private LocalDateTime createdAt;
+    
+    @Column(name = \"updated_at\")
+    @UpdateTimestamp
+    private LocalDateTime updatedAt;
+    
+    public void addQuality(VideoQuality quality) {
+        qualities.add(quality);
+        quality.setVideo(this);
+    }
+}
+
+@Entity
+@Table(name = \"video_qualities\")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class VideoQuality {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = \"quality_id\")
+    private Long qualityId;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = \"video_id\", nullable = false)
+    private Video video;
+    
+    @Column(name = \"quality_level\", nullable = false, length = 10)
+    private String qualityLevel;
+    
+    @Column(name = \"s3_url\", nullable = false, length = 500)
+    private String s3Url;
+    
+    @Column(name = \"file_size_bytes\")
+    private Long fileSizeBytes;
+    
+    @Column(name = \"bitrate_kbps\")
+    private Integer bitrateKbps;
+    
+    @Column(name = \"encoding_status\", length = 50)
+    @Enumerated(EnumType.STRING)
+    private EncodingStatus encodingStatus;
+    
+    @Column(name = \"encoded_at\")
+    private LocalDateTime encodedAt;
+    
+    @Column(name = \"created_at\", nullable = false, updatable = false)
+    @CreationTimestamp
+    private LocalDateTime createdAt;
+}
+```
+
+#### Repository with Custom Queries
+```java
+@Repository
+public interface VideoRepository extends JpaRepository<Video, String> {
+    
+    @Query(\"SELECT v FROM Video v WHERE v.uploaderId = :uploaderId \" +
+           \"ORDER BY v.createdAt DESC\")
+    Page<Video> findByUploaderId(@Param(\"uploaderId\") String uploaderId, Pageable pageable);
+    
+    @Query(\"SELECT v FROM Video v WHERE v.processingStatus = :status\")
+    List<Video> findByProcessingStatus(@Param(\"status\") ProcessingStatus status);
+    
+    @Query(\"SELECT v FROM Video v LEFT JOIN FETCH v.qualities \" +
+           \"WHERE v.videoId = :videoId\")
+    Optional<Video> findByIdWithQualities(@Param(\"videoId\") String videoId);
+    
+    @Modifying
+    @Query(\"UPDATE Video v SET v.processingStatus = :status \" +
+           \"WHERE v.videoId = :videoId\")
+    void updateStatus(@Param(\"videoId\") String videoId, 
+                     @Param(\"status\") ProcessingStatus status);
+}
+```
+
+#### Flyway Migration Best Practices
+```sql
+-- V1__create_videos_table.sql
+CREATE TABLE IF NOT EXISTS videos (
+    video_id VARCHAR(36) PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    uploader_id VARCHAR(36) NOT NULL,
+    original_filename VARCHAR(255),
+    duration_seconds INTEGER,
+    original_size_bytes BIGINT,
+    processing_status VARCHAR(50) NOT NULL DEFAULT 'UPLOADED',
+    thumbnail_url VARCHAR(500),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_videos_uploader ON videos(uploader_id);
+CREATE INDEX idx_videos_status ON videos(processing_status);
+CREATE INDEX idx_videos_created ON videos(created_at DESC);
+
+-- V2__create_video_qualities_table.sql
+CREATE TABLE IF NOT EXISTS video_qualities (
+    quality_id SERIAL PRIMARY KEY,
+    video_id VARCHAR(36) NOT NULL REFERENCES videos(video_id) ON DELETE CASCADE,
+    quality_level VARCHAR(10) NOT NULL,
+    s3_url VARCHAR(500) NOT NULL,
+    file_size_bytes BIGINT,
+    bitrate_kbps INTEGER,
+    encoding_status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+    encoded_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_qualities_video ON video_qualities(video_id);
+CREATE INDEX idx_qualities_status ON video_qualities(encoding_status);
+```
+
+### 7. Error Handling & Resilience
+
+#### Global Exception Handler
+```java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(InvalidFileException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidFile(InvalidFileException ex) {
+        log.error(\"Invalid file upload: {}\", ex.getMessage());
+        ErrorResponse error = ErrorResponse.builder()
+                .status(HttpStatus.BAD_REQUEST.value())
+                .error(\"Invalid File\")
+                .message(ex.getMessage())
+                .timestamp(LocalDateTime.now())
+                .build();
+        return ResponseEntity.badRequest().body(error);
+    }
+    
+    @ExceptionHandler(VideoNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleVideoNotFound(VideoNotFoundException ex) {
+        log.error(\"Video not found: {}\", ex.getMessage());
+        ErrorResponse error = ErrorResponse.builder()
+                .status(HttpStatus.NOT_FOUND.value())
+                .error(\"Video Not Found\")
+                .message(ex.getMessage())
+                .timestamp(LocalDateTime.now())
+                .build();
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(error);
+    }
+    
+    @ExceptionHandler(EncodingException.class)
+    public ResponseEntity<ErrorResponse> handleEncodingError(EncodingException ex) {
+        log.error(\"Encoding error: {}\", ex.getMessage(), ex);
+        ErrorResponse error = ErrorResponse.builder()
+                .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
+                .error(\"Encoding Failed\")
+                .message(\"Video encoding failed. Please try again.\")
+                .timestamp(LocalDateTime.now())
+                .build();
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(error);
+    }
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGeneralError(Exception ex) {
+        log.error(\"Unexpected error: {}\", ex.getMessage(), ex);
+        ErrorResponse error = ErrorResponse.builder()
+                .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
+                .error(\"Internal Server Error\")
+                .message(\"An unexpected error occurred\")
+                .timestamp(LocalDateTime.now())
+                .build();
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(error);
+    }
+}
+
+@Data
+@Builder
+class ErrorResponse {
+    private int status;
+    private String error;
+    private String message;
+    private LocalDateTime timestamp;
+}
+```
+
+#### Retry Logic with Resilience4j
+```java
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class S3ServiceWithRetry {
+    
+    private final AmazonS3 s3Client;
+    
+    @Retry(name = \"s3Upload\", fallbackMethod = \"uploadFallback\")
+    @CircuitBreaker(name = \"s3Upload\")
+    public String uploadFile(String bucketName, String key, File file) {
+        log.info(\"Attempting to upload file to S3: {}/{}\", bucketName, key);
+        
+        PutObjectRequest request = new PutObjectRequest(bucketName, key, file);
+        s3Client.putObject(request);
+        
+        return s3Client.getUrl(bucketName, key).toString();
+    }
+    
+    private String uploadFallback(String bucketName, String key, File file, Exception e) {
+        log.error(\"Failed to upload to S3 after retries: {}/{}\", bucketName, key, e);
+        throw new S3UploadException(\"Failed to upload file to S3\", e);
+    }
+}
+```
+
+```yaml
+# application.yml - Resilience4j Configuration
+resilience4j:
+  retry:
+    instances:
+      s3Upload:
+        max-attempts: 3
+        wait-duration: 1s
+        exponential-backoff-multiplier: 2
+        retry-exceptions:
+          - com.amazonaws.SdkClientException
+          - java.io.IOException
+  
+  circuitbreaker:
+    instances:
+      s3Upload:
+        register-health-indicator: true
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        permitted-number-of-calls-in-half-open-state: 3
+        wait-duration-in-open-state: 10s
+        failure-rate-threshold: 50
+        automatic-transition-from-open-to-half-open-enabled: true
+```
+
+### 8. Monitoring & Observability
+
+#### Spring Boot Actuator Configuration
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  health:
+    kafka:
+      enabled: true
+    db:
+      enabled: true
+```
+
+#### Custom Health Indicators
+```java
+@Component
+public class S3HealthIndicator implements HealthIndicator {
+    
+    private final AmazonS3 s3Client;
+    private final String bucketName;
+    
+    @Override
+    public Health health() {
+        try {
+            boolean bucketExists = s3Client.doesBucketExistV2(bucketName);
+            if (bucketExists) {
+                return Health.up()
+                        .withDetail(\"bucket\", bucketName)
+                        .withDetail(\"status\", \"accessible\")
+                        .build();
+            } else {
+                return Health.down()
+                        .withDetail(\"bucket\", bucketName)
+                        .withDetail(\"status\", \"not found\")
+                        .build();
+            }
+        } catch (Exception e) {
+            return Health.down()
+                    .withDetail(\"bucket\", bucketName)
+                    .withDetail(\"error\", e.getMessage())
+                    .build();
+        }
+    }
+}
+```
+
+#### Structured Logging with Correlation IDs
+```java
+@Component
+@Slf4j
+public class CorrelationIdFilter implements Filter {
+    
+    private static final String CORRELATION_ID_HEADER = \"X-Correlation-ID\";
+    private static final String CORRELATION_ID_LOG_VAR = \"correlationId\";
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        String correlationId = httpRequest.getHeader(CORRELATION_ID_HEADER);
+        
+        if (correlationId == null || correlationId.isEmpty()) {
+            correlationId = UUID.randomUUID().toString();
+        }
+        
+        MDC.put(CORRELATION_ID_LOG_VAR, correlationId);
+        
+        try {
+            HttpServletResponse httpResponse = (HttpServletResponse) response;
+            httpResponse.setHeader(CORRELATION_ID_HEADER, correlationId);
+            chain.doFilter(request, response);
+        } finally {
+            MDC.remove(CORRELATION_ID_LOG_VAR);
+        }
+    }
+}
+```
+
+```xml
+<!-- logback-spring.xml -->
+<configuration>
+    <appender name=\"CONSOLE\" class=\"ch.qos.logback.core.ConsoleAppender\">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{correlationId}] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    
+    <appender name=\"FILE\" class=\"ch.qos.logback.core.rolling.RollingFileAppender\">
+        <file>logs/application.log</file>
+        <rollingPolicy class=\"ch.qos.logback.core.rolling.TimeBasedRollingPolicy\">
+            <fileNamePattern>logs/application-%d{yyyy-MM-dd}.log</fileNamePattern>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+        <encoder class=\"net.logstash.logback.encoder.LogstashEncoder\"/>
+    </appender>
+    
+    <root level=\"INFO\">
+        <appender-ref ref=\"CONSOLE\"/>
+        <appender-ref ref=\"FILE\"/>
+    </root>
+</configuration>
+```
+
+### 9. Security Best Practices
+
+#### Basic Security Configuration
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf().disable() // For development; enable in production with proper token handling
+            .cors().and()
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(\"/api/v1/videos/upload\").authenticated()
+                .requestMatchers(\"/api/v1/stream/**\").permitAll()
+                .requestMatchers(\"/actuator/health\").permitAll()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer().jwt(); // If using JWT authentication
+        
+        return http.build();
+    }
+    
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOrigins(Arrays.asList(\"http://localhost:3000\"));
+        configuration.setAllowedMethods(Arrays.asList(\"GET\", \"POST\", \"PUT\", \"DELETE\", \"OPTIONS\"));
+        configuration.setAllowedHeaders(Arrays.asList(\"*\"));
+        configuration.setAllowCredentials(true);
+        
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration(\"/**\", configuration);
+        return source;
+    }
+}
+```
+
+#### Input Validation
+```java
+@Data
+@Builder
+public class VideoMetadataRequest {
+    
+    @NotBlank(message = \"Title is required\")
+    @Size(min = 3, max = 255, message = \"Title must be between 3 and 255 characters\")
+    private String title;
+    
+    @Size(max = 2000, message = \"Description cannot exceed 2000 characters\")
+    private String description;
+    
+    @NotNull(message = \"Uploader ID is required\")
+    private String uploaderId;
+}
+
+@Component
+public class VideoValidator {
+    
+    private static final long MAX_FILE_SIZE = 2L * 1024 * 1024 * 1024; // 2GB
+    private static final List<String> ALLOWED_CONTENT_TYPES = Arrays.asList(
+            \"video/mp4\",
+            \"video/mpeg\",
+            \"video/quicktime\",
+            \"video/x-msvideo\",
+            \"video/x-matroska\"
+    );
+    
+    public void validate(MultipartFile file) {
+        if (file.isEmpty()) {
+            throw new InvalidFileException(\"File is empty\");
+        }
+        
+        if (file.getSize() > MAX_FILE_SIZE) {
+            throw new InvalidFileException(\"File size exceeds maximum limit of 2GB\");
+        }
+        
+        String contentType = file.getContentType();
+        if (contentType == null || !ALLOWED_CONTENT_TYPES.contains(contentType)) {
+            throw new InvalidFileException(\"Invalid file type. Only video files are allowed\");
+        }
+        
+        // Additional validation: check file extension
+        String filename = file.getOriginalFilename();
+        if (filename == null || !hasValidExtension(filename)) {
+            throw new InvalidFileException(\"Invalid file extension\");
+        }
+    }
+    
+    private boolean hasValidExtension(String filename) {
+        String extension = filename.substring(filename.lastIndexOf(\".\") + 1).toLowerCase();
+        return Arrays.asList(\"mp4\", \"mpeg\", \"mov\", \"avi\", \"mkv\").contains(extension);
+    }
+}
+```
+
+### 10. Testing Best Practices
+
+#### Unit Tests
+```java
+@SpringBootTest
+@TestPropertySource(locations = \"classpath:application-test.yml\")
+class UploadServiceTest {
+    
+    @MockBean
+    private S3Service s3Service;
+    
+    @MockBean
+    private KafkaProducerService kafkaProducerService;
+    
+    @Autowired
+    private UploadService uploadService;
+    
+    @Test
+    void testSuccessfulUpload() {
+        // Arrange
+        MockMultipartFile file = new MockMultipartFile(
+                \"video\",
+                \"test-video.mp4\",
+                \"video/mp4\",
+                \"test content\".getBytes()
+        );
+        
+        VideoMetadataRequest metadata = VideoMetadataRequest.builder()
+                .title(\"Test Video\")
+                .description(\"Test Description\")
+                .uploaderId(\"user-123\")
+                .build();
+        
+        String expectedS3Url = \"https://s3.amazonaws.com/bucket/video-123.mp4\";
+        when(s3Service.uploadRawVideo(anyString(), any())).thenReturn(expectedS3Url);
+        
+        // Act
+        UploadResponse response = uploadService.processUpload(file, metadata);
+        
+        // Assert
+        assertNotNull(response.getVideoId());
+        assertEquals(\"UPLOADED\", response.getStatus());
+        verify(s3Service, times(1)).uploadRawVideo(anyString(), any());
+        verify(kafkaProducerService, times(1)).sendUploadEvent(any());
+    }
+}
+```
+
+#### Integration Tests
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Testcontainers
+@AutoConfigureMockMvc
+class UploadControllerIntegrationTest {
+    
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(\"postgres:15-alpine\")
+            .withDatabaseName(\"testdb\")
+            .withUsername(\"test\")
+            .withPassword(\"test\");
+    
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(
+            DockerImageName.parse(\"confluentinc/cp-kafka:7.5.0\")
+    );
+    
+    @Autowired
+    private MockMvc mockMvc;
+    
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add(\"spring.datasource.url\", postgres::getJdbcUrl);
+        registry.add(\"spring.datasource.username\", postgres::getUsername);
+        registry.add(\"spring.datasource.password\", postgres::getPassword);
+        registry.add(\"spring.kafka.bootstrap-servers\", kafka::getBootstrapServers);
+    }
+    
+    @Test
+    void testUploadEndpoint() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                \"file\",
+                \"test.mp4\",
+                \"video/mp4\",
+                \"video content\".getBytes()
+        );
+        
+        mockMvc.perform(multipart(\"/api/v1/videos/upload\")
+                .file(file)
+                .param(\"title\", \"Test Video\")
+                .param(\"uploaderId\", \"user-123\"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath(\"$.videoId\").exists())
+                .andExpect(jsonPath(\"$.status\").value(\"UPLOADED\"));
+    }
+}
+```
+
+---
+
+## Frontend Development Guidelines
+
+### Next.js Project Structure
+
+```typescript
+// lib/api/upload.ts
+export interface UploadProgress {
+  loaded: number;
+  total: number;
+  percentage: number;
+}
+
+export interface UploadResponse {
+  videoId: string;
+  status: string;
+  message: string;
+}
+
+export async function uploadVideo(
+  file: File,
+  metadata: { title: string; description?: string },
+  onProgress?: (progress: UploadProgress) => void
+): Promise<UploadResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('title', metadata.title);
+  if (metadata.description) {
+    formData.append('description', metadata.description);
+  }
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable && onProgress) {
+        onProgress({
+          loaded: event.loaded,
+          total: event.total,
+          percentage: Math.round((event.loaded / event.total) * 100),
+        });
+      }
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 200) {
+        resolve(JSON.parse(xhr.responseText));
+      } else {
+        reject(new Error(`Upload failed with status ${xhr.status}`));
+      }
+    });
+
+    xhr.addEventListener('error', () => {
+      reject(new Error('Upload failed'));
+    });
+
+    xhr.open('POST', `${process.env.NEXT_PUBLIC_UPLOAD_API_URL}/videos/upload`);
+    xhr.send(formData);
+  });
+}
+```
+
+```typescript
+// components/upload/FileUploadZone.tsx
+'use client';
+
+import { useCallback, useState } from 'react';
+import { useDropzone } from 'react-dropzone';
+import { Upload, File, X } from 'lucide-react';
+
+interface FileUploadZoneProps {
+  onFileSelect: (file: File) => void;
+  selectedFile: File | null;
+  onClearFile: () => void;
+}
+
+export default function FileUploadZone({
+  onFileSelect,
+  selectedFile,
+  onClearFile,
+}: FileUploadZoneProps) {
+  const [error, setError] = useState<string>('');
+
+  const onDrop = useCallback(
+    (acceptedFiles: File[], rejectedFiles: any[]) => {
+      if (rejectedFiles.length > 0) {
+        setError('Please upload a valid video file (max 2GB)');
+        return;
+      }
+
+      if (acceptedFiles.length > 0) {
+        setError('');
+        onFileSelect(acceptedFiles[0]);
+      }
+    },
+    [onFileSelect]
+  );
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'video/*': ['.mp4', '.mov', '.avi', '.mkv', '.mpeg'],
+    },
+    maxSize: 2 * 1024 * 1024 * 1024, // 2GB
+    multiple: false,
+  });
+
+  return (
+    <div className=\"w-full\">
+      {!selectedFile ? (
+        <div
+          {...getRootProps()}
+          className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition-colors ${
+            isDragActive
+              ? 'border-blue-500 bg-blue-50'
+              : 'border-gray-300 hover:border-gray-400'
+          }`}
+        >
+          <input {...getInputProps()} />
+          <Upload className=\"mx-auto h-12 w-12 text-gray-400\" />
+          <p className=\"mt-4 text-lg font-medium text-gray-700\">
+            {isDragActive
+              ? 'Drop your video here'
+              : 'Drag and drop your video here'}
+          </p>
+          <p className=\"mt-2 text-sm text-gray-500\">
+            or click to browse (MP4, MOV, AVI, MKV - Max 2GB)
+          </p>
+          {error && <p className=\"mt-2 text-sm text-red-600\">{error}</p>}
+        </div>
+      ) : (
+        <div className=\"border rounded-lg p-6 bg-gray-50\">
+          <div className=\"flex items-center justify-between\">
+            <div className=\"flex items-center space-x-3\">
+              <File className=\"h-8 w-8 text-blue-500\" />
+              <div>
+                <p className=\"font-medium text-gray-900\">{selectedFile.name}</p>
+                <p className=\"text-sm text-gray-500\">
+                  {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={onClearFile}
+              className=\"p-2 hover:bg-gray-200 rounded-full transition-colors\"
+            >
+              <X className=\"h-5 w-5 text-gray-600\" />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+```typescript
+// app/upload/page.tsx
+'use client';
+
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import FileUploadZone from '@/components/upload/FileUploadZone';
+import UploadProgress from '@/components/upload/UploadProgress';
+import MetadataForm from '@/components/upload/MetadataForm';
+import { uploadVideo, UploadProgress as UploadProgressType } from '@/lib/api/upload';
+
+export default function UploadPage() {
+  const router = useRouter();
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<UploadProgressType | null>(null);
+  const [error, setError] = useState<string>('');
+
+  const handleUpload = async () => {
+    if (!selectedFile || !title) {
+      setError('Please select a file and enter a title');
+      return;
+    }
+
+    setUploading(true);
+    setError('');
+
+    try {
+      const response = await uploadVideo(
+        selectedFile,
+        { title, description },
+        (progressData) => {
+          setProgress(progressData);
+        }
+      );
+
+      // Redirect to videos page or show success message
+      router.push(`/watch/${response.videoId}`);
+    } catch (err) {
+      setError('Upload failed. Please try again.');
+      console.error(err);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div className=\"container mx-auto px-4 py-8 max-w-3xl\">
+      <h1 className=\"text-3xl font-bold mb-8\">Upload Video</h1>
+
+      <div className=\"space-y-6\">
+        <FileUploadZone
+          onFileSelect={setSelectedFile}
+          selectedFile={selectedFile}
+          onClearFile={() => setSelectedFile(null)}
+        />
+
+        {selectedFile && !uploading && (
+          <MetadataForm
+            title={title}
+            description={description}
+            onTitleChange={setTitle}
+            onDescriptionChange={setDescription}
+            onSubmit={handleUpload}
+          />
+        )}
+
+        {uploading && progress && (
+          <UploadProgress
+            percentage={progress.percentage}
+            loaded={progress.loaded}
+            total={progress.total}
+          />
+        )}
+
+        {error && (
+          <div className=\"bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded\">
+            {error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## Development Workflow
+
+### Local Development Setup
+
+1. **Prerequisites Installation**
+```bash
+# Install Java 21
+sdk install java 21.0.1-tem
+
+# Install Maven
+brew install maven  # macOS
+# or download from https://maven.apache.org/
+
+# Install Node.js and npm
+nvm install 20
+nvm use 20
+
+# Install Docker Desktop
+# Download from https://www.docker.com/products/docker-desktop
+
+# Install FFmpeg
+brew install ffmpeg  # macOS
+sudo apt install ffmpeg  # Ubuntu
+```
+
+2. **Clone and Setup**
+```bash
+# Clone repository
+git clone <your-repo-url>
+cd videovault
+
+# Start infrastructure services
+docker-compose up -d kafka zookeeper postgres localstack
+
+# Wait for services to be ready
+./scripts/wait-for-services.sh
+
+# Initialize S3 buckets
+./scripts/init-s3.sh
+```
+
+3. **Build and Run Backend Services**
+```bash
+# Build all services
+cd backend
+mvn clean install
+
+# Run services individually (in separate terminals)
+cd upload-service && mvn spring-boot:run
+cd encoder-service && mvn spring-boot:run -Dspring-boot.run.arguments=\"--encoding.quality=1080p\"
+cd encoder-service && mvn spring-boot:run -Dspring-boot.run.arguments=\"--encoding.quality=720p\"
+cd encoder-service && mvn spring-boot:run -Dspring-boot.run.arguments=\"--encoding.quality=480p\"
+cd metadata-service && mvn spring-boot:run
+cd streaming-service && mvn spring-boot:run
+```
+
+4. **Run Frontend**
+```bash
+cd frontend/videovault-web
+npm install
+npm run dev
+```
+
+5. **Access Services**
+```
+Frontend: http://localhost:3000
+Upload Service: http://localhost:8081
+Metadata Service: http://localhost:8082
+Streaming Service: http://localhost:8083
+Kafka UI: http://localhost:9000 (if using kafka-ui)
+```
+
+### Git Workflow
+
+```bash
+# Feature branch workflow
+git checkout -b feature/encoder-optimization
+# Make changes
+git add .
+git commit -m \"feat: optimize FFmpeg encoding parameters\"
+git push origin feature/encoder-optimization
+# Create pull request
+```
+
+### Commit Message Convention
+Follow Conventional Commits:
+```
+feat: add thumbnail generation
+fix: resolve S3 upload timeout
+docs: update API documentation
+refactor: extract encoding logic to separate service
+test: add integration tests for upload flow
+chore: update dependencies
+```
+
+---
+
+## Deployment Strategy
+
+### Kubernetes Deployment
+
+```yaml
+# kubernetes/deployments/encoder-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encoder-service
+  namespace: videovault
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: encoder-service
+  template:
+    metadata:
+      labels:
+        app: encoder-service
+    spec:
+      containers:
+      - name: encoder
+        image: videovault/encoder-service:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: \"prod\"
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: \"kafka-service:9092\"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: access-key-id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: secret-access-key
+        resources:
+          requests:
+            memory: \"2Gi\"
+            cpu: \"1000m\"
+          limits:
+            memory: \"4Gi\"
+            cpu: \"2000m\"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 5
+```
+
+---
+
+## Performance Optimization Tips
+
+1. **Database Connection Pooling**
+```yaml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+```
+
+2. **Kafka Producer Batching**
+```yaml
+spring:
+  kafka:
+    producer:
+      batch-size: 16384
+      linger-ms: 10
+      compression-type: snappy
+```
+
+3. **S3 Transfer Optimization**
+```java
+// Use TransferManager for large files
+TransferManager transferManager = TransferManagerBuilder
+    .standard()
+    .withS3Client(s3Client)
+    .withMinimumUploadPartSize(10L * 1024 * 1024) // 10MB
+    .withMultipartUploadThreshold(20L * 1024 * 1024) // 20MB
+    .build();
+```
+
+4. **FFmpeg Encoding Optimization**
+```bash
+# Use hardware acceleration if available
+ffmpeg -hwaccel cuda -i input.mp4 ...  # NVIDIA GPU
+ffmpeg -hwaccel videotoolbox -i input.mp4 ...  # macOS
+```
+
+---
+
+## Next Steps & Roadmap
+
+### Phase 1: MVP (Weeks 1-4)
+- ✅ Setup project structure
+- ✅ Implement upload service
+- ✅ Implement basic encoding (single quality)
+- ✅ Implement metadata service
+- ✅ Implement streaming service
+- ✅ Build basic frontend
+
+### Phase 2: Core Features (Weeks 5-8)
+- Multiple quality encoding (1080p, 720p, 480p)
+- Thumbnail generation
+- Progress tracking
+- Error handling and retry logic
+- Basic analytics
+
+### Phase 3: Production Ready (Weeks 9-12)
+- Authentication and authorization
+- Rate limiting
+- CDN integration
+- Monitoring and alerting
+- Load testing
+- Documentation
+
+### Phase 4: Advanced Features (Future)
+- Adaptive bitrate streaming (HLS/DASH)
+- Live streaming support
+- Subtitle support
+- Video editing capabilities
+- AI-powered features (auto-tagging, content moderation)
+- Mobile apps
+
+---
+
+## Additional Resources & Documentation
+
+### Official Documentation
+- Spring Boot: https://spring.io/projects/spring-boot
+- Apache Kafka: https://kafka.apache.org/documentation/
+- gRPC: https://grpc.io/docs/
+- FFmpeg: https://ffmpeg.org/documentation.html
+- AWS S3: https://docs.aws.amazon.com/s3/
+- Next.js: https://nextjs.org/docs
+- PostgreSQL: https://www.postgresql.org/docs/
+
+### Recommended Learning
+- Microservices Architecture by Chris Richardson
+- Designing Data-Intensive Applications by Martin Kleppmann
+- Building Microservices by Sam Newman
+
+### Tools
+- Postman/Insomnia for API testing
+- kafkacat/kcat for Kafka debugging
+- pgAdmin for PostgreSQL management
+- Docker Desktop for container management
+- IntelliJ IDEA or VS Code for development
+
+---
+
+## Key Reminders
+
+1. **Always start with the basics** - Get a simple version working first, then add complexity
+2. **Test early and often** - Write tests as you develop, not after
+3. **Monitor from day one** - Add logging and metrics from the start
+4. **Document as you go** - Update README and docs with each feature
+5. **Security is not optional** - Implement authentication, validation, and encryption
+6. **Think about scale** - Design for horizontal scaling even if you start small
+7. **Handle failures gracefully** - Network calls fail, services crash, plan for it
+8. **Keep it simple** - Don't over-engineer, solve the problem at hand
+
+---
+
+## Common Pitfalls to Avoid
+
+1. **Not handling Kafka consumer offset commits properly** - Can lead to duplicate processing
+2. **Forgetting to clean up temporary files** - Will fill up disk space quickly
+3. **Not implementing proper error handling in async operations** - Errors disappear silently
+4. **Hardcoding configuration** - Use environment variables and configuration files
+5. **Not implementing health checks** - Makes debugging deployment issues difficult
+6. **Ignoring database indexes** - Queries will be slow as data grows
+7. **Not implementing proper logging** - Makes debugging production issues impossible
+8. **Skipping input validation** - Security and data integrity nightmare
+9. **Not testing with realistic file sizes** - 10MB test files don't represent 2GB uploads
+10. **Forgetting about CORS** - Frontend won't be able to make API calls
+
+---
+
+This comprehensive guide should provide everything needed to start building the videovault video processing platform. Begin with the MVP features, follow the best practices outlined, and gradually add more sophisticated capabilities as you gain confidence with the architecture.
+
+Good luck with your project! Remember: start simple, iterate quickly, and always keep the end user experience in mind.`
+}
