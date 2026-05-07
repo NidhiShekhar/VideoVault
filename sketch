@@ -23,14 +23,14 @@ This is a **microservices-based distributed system** built on the following prin
 ### Complete Flow Diagram Explanation
 
 ```
-User Upload → Middleware Service → S3 (Raw Videos) → Kafka (Uploaded Topic)
+User Upload → Middleware Service → Object store (local by default; optional Supabase) → Kafka (Uploaded Topic)
                                                             ↓
                                     ┌───────────────────────┼───────────────────────┐
                                     ↓                       ↓                       ↓
                             Encoder Service          Encoder Service         Encoder Service
                               (1080p)                   (720p)                  (480p)
                                     ↓                       ↓                       ↓
-                            S3 (Processed)            S3 (Processed)          S3 (Processed)
+                            Object store (processed)  Object store (processed) Object store (processed)
                                     ↓                       ↓                       ↓
                                     └───────────────────────┼───────────────────────┘
                                                             ↓
@@ -50,14 +50,14 @@ User Upload → Middleware Service → S3 (Raw Videos) → Kafka (Uploaded Topic
 ### Detailed Service Breakdown
 
 #### Service 1: Upload Middleware Service
-**Responsibility:** Initial point of contact for video uploads, S3 orchestration, event production
+**Responsibility:** Initial point of contact for video (and optional image) uploads, **BlobStore** orchestration, event production
 
 **Key Functions:**
 - Accept video uploads via REST API (multipart/form-data)
 - Validate video files (format, size, duration limits)
 - Generate unique video IDs (UUID)
-- Upload raw video to S3 bucket (with proper naming convention)
-- Produce Kafka event to \"uploaded-videos\" topic with S3 location
+- Upload raw video via **BlobStore** (local filesystem in dev; Supabase when toggled) using the agreed key convention
+- Produce Kafka event to \"uploaded-videos\" topic with **object key** (not a hardcoded S3 URL)
 - Return upload confirmation with video ID to frontend
 - Handle upload progress tracking (optional: WebSocket for real-time progress)
 
@@ -76,7 +76,7 @@ GET /api/v1/videos/upload/status/{videoId}
 
 **Key Functions:**
 - Listen to Kafka \"uploaded-videos\" topic
-- Download raw video from S3
+- Download raw video via **BlobStore**
 - Encode video using FFmpeg to specific quality (1080p/720p/480p)
 - Apply encoding best practices:
   - H.264 codec for video (widely supported)
@@ -84,7 +84,7 @@ GET /api/v1/videos/upload/status/{videoId}
   - Appropriate bitrate for each quality level
   - Constant Rate Factor (CRF) for quality control
   - Two-pass encoding for better compression
-- Upload encoded video to S3 (organized by quality)
+- Upload encoded video via **BlobStore** (organized by quality)
 - Produce event to Kafka \"encoded-videos\" topic
 - Handle encoding failures with retry logic
 - Clean up temporary files
@@ -118,7 +118,7 @@ GET /api/v1/videos/upload/status/{videoId}
 - Store comprehensive video metadata in PostgreSQL:
   - Video ID, title, description, upload timestamp
   - Original file information (size, duration, format)
-  - Available quality levels and their S3 URLs
+  - Available quality levels and **playback URLs** (HTTPS from Supabase when toggled, or same-origin paths served from disk when `STORAGE_BACKEND=local`) — store whatever the streaming layer returns, not hardcoded vendor URLs in domain logic
   - Encoding status (pending, processing, completed, failed)
   - User information (uploader ID)
   - View counts, timestamps
@@ -152,7 +152,7 @@ CREATE TABLE video_qualities (
     quality_id SERIAL PRIMARY KEY,
     video_id UUID REFERENCES videos(video_id) ON DELETE CASCADE,
     quality_level VARCHAR(10) NOT NULL, -- '1080p', '720p', '480p'
-    s3_url VARCHAR(500) NOT NULL,
+    playback_url VARCHAR(500) NOT NULL, -- historically s3_url; stores any backend’s URL or resolvable path
     file_size_bytes BIGINT,
     bitrate_kbps INTEGER,
     encoding_status VARCHAR(50),
@@ -186,7 +186,7 @@ CREATE INDEX idx_qualities_video ON video_qualities(video_id);
   - Optional: HLS (HTTP Live Streaming) or DASH support
 - Return appropriate quality URLs based on client request
 - Track view analytics (optional)
-- Implement CDN integration (CloudFront, CloudFlare)
+- Optional CDN integration later; for this project, same-origin or Supabase URLs are enough
 - Handle authentication and authorization
 
 **Endpoints:**
@@ -198,7 +198,7 @@ GET /api/v1/stream/videos/{videoId}
   - Returns: Video metadata with available quality URLs
 
 GET /api/v1/stream/videos/{videoId}/play?quality=720p
-  - Returns: Streaming URL or redirects to S3/CDN
+  - Returns: Playback URL or redirect — local file route, signed Supabase URL, or future CDN; never assumes AWS
 
 GET /api/v1/stream/videos/{videoId}/thumbnail
   - Returns: Thumbnail image
@@ -210,16 +210,16 @@ GET /api/v1/stream/videos/{videoId}/thumbnail
 
 ### Backend Technologies
 
-#### Spring Boot Framework
-- **Version:** Spring Boot 3.x with Java 17 or 21
-- **Why:** Production-grade, enterprise-ready, excellent ecosystem
-- **Dependencies to include:**
-  - spring-boot-starter-web (REST APIs)
-  - spring-boot-starter-data-jpa (Database access)
-  - spring-boot-starter-validation (Input validation)
-  - spring-boot-starter-actuator (Health checks, metrics)
-  - spring-kafka (Kafka integration)
-  - grpc-spring-boot-starter (gRPC support)
+#### Go (Golang) Backend Stack
+- **Version:** Go 1.22+ (or latest stable)
+- **Why:** High concurrency, fast startup, low memory footprint, simple deployment
+- **Libraries to include:**
+  - `gin` or `chi` (REST APIs)
+  - `pgx` + `sqlc` or `gorm` (Database access)
+  - `go-playground/validator` (Input validation)
+  - `prometheus/client_golang` + `/healthz` endpoint (Health checks and metrics)
+  - `sarama` or `franz-go` (Kafka integration)
+  - `grpc-go` (gRPC support)
 
 #### Apache Kafka
 - **Version:** 3.x
@@ -269,7 +269,7 @@ message VideoMetadata {
 
 message QualityInfo {
   string quality_level = 1;
-  string s3_url = 2;
+  string playback_url = 2; // was s3_url; opaque URL/path from current STORAGE_BACKEND
   int64 file_size_bytes = 3;
   int32 bitrate_kbps = 4;
 }
@@ -312,29 +312,38 @@ message MetadataResponse {
   - Configure regular backups
   - Use prepared statements to prevent SQL injection
 
-#### Amazon S3 (or S3-compatible storage)
-- **Purpose:** Object storage for video files
-- **Bucket Structure:**
+#### Object storage (local-first; optional Supabase; optional S3-compatible in Docker)
+
+- **Purpose:** Durable blobs for **videos** (raw, encoded renditions, thumbnails) and **images** (originals, optional previews). This VideoVault instance is a **small-scale learning project** — not designed for YouTube-scale traffic; a local directory or a **single Supabase bucket** within the free tier is an expected target.
+- **Default for all development:** **`STORAGE_BACKEND=local`**. Files live under a configurable directory on disk (e.g. `STORAGE_LOCAL_ROOT=./.data/storage`). **Do not** configure or call remote object storage (Supabase Storage, AWS, R2, etc.) during normal dev work unless you **deliberately** flip the backend for an integration test or a personal demo.
+- **Toggle for remote (e.g. Supabase):** Set **`STORAGE_BACKEND=supabase`** and supply **`SUPABASE_URL`**, **`SUPABASE_SERVICE_ROLE_KEY`** (server-side only; never expose to browsers), and **`SUPABASE_STORAGE_BUCKET`** via environment variables. The **same object key layout** and **same Go `BlobStore` interface** must work for `local` and `supabase` so switching backends is configuration + constructor wiring, not a rewrite of upload/encoder/streaming logic.
+- **Images:** Use the **same storage abstraction** as video. FFmpeg does not apply to ordinary image uploads; gate processing in the encoder or a separate worker by asset type. Suggested key layout (one logical bucket / one local root):
+
 ```
-video-storage-bucket/
-├── raw/
-│   └── {video-id}/
-│       └── original.{ext}
-├── processed/
-│   └── {video-id}/
-│       ├── 1080p.mp4
-│       ├── 720p.mp4
-│       └── 480p.mp4
-└── thumbnails/
-    └── {video-id}/
-        └── thumbnail.jpg
+object-root/   # local folder or Supabase bucket
+├── raw/{video-id}/original.{ext}
+├── processed/{video-id}/1080p.mp4
+├── processed/{video-id}/720p.mp4
+├── processed/{video-id}/480p.mp4
+├── thumbnails/{video-id}/thumbnail.jpg
+└── images/
+    ├── originals/{image-id}.{ext}
+    └── previews/{image-id}.webp   # optional derivative
 ```
-- **Best Practices:**
-  - Use lifecycle policies to move old content to cheaper storage tiers
-  - Enable versioning for important buckets
-  - Set CORS policies for frontend access
-  - Use presigned URLs for secure, temporary access
-  - Implement server-side encryption
+
+- **Optional offline “S3-shaped” practice:** Docker Compose may include **MinIO** or **LocalStack S3** if you want to exercise an S3-compatible SDK **without** sending data to the internet. That still counts as **local** traffic (loopback / Docker network). For the **simplest** dev loop, prefer the **`local` filesystem backend** and skip emulators until you need them.
+- **Supabase in production/demo:** Your current pattern (dozens of high-res images, ~1 minute clips) is appropriate for staying inside typical free-tier limits; keep an eye on dashboard quotas. Prefer **signed URLs** (or public bucket + stable paths) for playback, consistent with how you already use Supabase.
+- **Codebase structure you must follow:**
+  1. **`backend/shared/storage/`** (or a repo-root **`pkg/storage/`** if you standardize on a Go workspace): define a **`BlobStore`** interface — e.g. put/get/open stream, delete, and “resolve playback URL” (local: path or same-origin URL served by the streaming/upload API; Supabase: public or signed URL).
+  2. Implement **`local`** and **`supabase`** in subpackages or files next to **`config.go`** that reads `STORAGE_BACKEND` and related env vars. **No** scattered Supabase HTTP or S3 calls inside `internal/service` domain code.
+  3. **Upload, encoder, and streaming** services depend on **`BlobStore`**, not on a vendor SDK type, so tests can use a temp-directory local store.
+  4. **`.env.example`**: document `STORAGE_BACKEND=local` first; list Supabase variables as **commented** optional lines so the default clone path never requires network storage.
+  5. Add **tests** for the local implementation always; treat Supabase tests as **optional** (`//go:build integration`) so CI/dev laptops stay offline-friendly.
+
+- **Best practices when you do use remote storage:**
+  - CORS only where browsers upload directly
+  - Short-lived or presigned URLs for private objects
+  - Encryption and lifecycle rules if you ever move beyond a personal demo
 
 #### Docker
 - **Purpose:** Containerization for consistency and deployment
@@ -394,6 +403,10 @@ Components needed:
 ### Monorepo vs Polyrepo Decision
 **Recommendation:** Start with a **monorepo** for easier development, then split if needed.
 
+### Storage abstraction (memorize this)
+
+When you create the real repo, **start from `STORAGE_BACKEND=local`**. Every service that touches bytes should accept a **`BlobStore` interface** from `backend/shared/storage` (or `pkg/storage`). **Videos and images** share that layer; only processing pipelines differ. Remote Supabase is a **second implementation** behind the same interface, enabled only when you set env vars and flip `STORAGE_BACKEND`. This keeps the project aligned with the “offline dev, optional small cloud demo” goal.
+
 ### Directory Structure
 
 ```
@@ -401,6 +414,7 @@ videovault/
 ├── README.md
 ├── docker-compose.yml
 ├── .gitignore
+├── .env.example              # STORAGE_BACKEND=local by default; Supabase vars commented
 ├── docs/
 │   ├── architecture.md
 │   ├── api-documentation.md
@@ -412,148 +426,161 @@ videovault/
 │   │   ├── proto/
 │   │   │   └── video-metadata.proto
 │   │   ├── common-models/
-│   │   └── common-utils/
+│   │   ├── common-utils/
+│   │   └── storage/                    # BlobStore interface + backends (NON-OPTIONAL)
+│   │       ├── blob.go                 # interface + object key helpers (video + image)
+│   │       ├── config.go               # STORAGE_BACKEND, local root, Supabase settings
+│   │       ├── local.go                # filesystem implementation (default)
+│   │       ├── supabase.go             # Supabase Storage REST (toggle only)
+│   │       ├── doc.go                  # package doc: local-first reminder
+│   │       └── blob_test.go
 │   │
 │   ├── upload-service/
-│   │   ├── src/
-│   │   │   ├── main/
-│   │   │   │   ├── java/
-│   │   │   │   │   └── com/videovault/upload/
-│   │   │   │   │       ├── UploadServiceApplication.java
-│   │   │   │   │       ├── config/
-│   │   │   │   │       │   ├── S3Config.java
-│   │   │   │   │       │   ├── KafkaProducerConfig.java
-│   │   │   │   │       │   └── SecurityConfig.java
-│   │   │   │   │       ├── controller/
-│   │   │   │   │       │   └── UploadController.java
-│   │   │   │   │       ├── service/
-│   │   │   │   │       │   ├── UploadService.java
-│   │   │   │   │       │   ├── S3Service.java
-│   │   │   │   │       │   └── KafkaProducerService.java
-│   │   │   │   │       ├── model/
-│   │   │   │   │       │   ├── UploadRequest.java
-│   │   │   │   │       │   ├── UploadResponse.java
-│   │   │   │   │       │   └── VideoUploadEvent.java
-│   │   │   │   │       ├── exception/
-│   │   │   │   │       │   ├── GlobalExceptionHandler.java
-│   │   │   │   │       │   └── UploadException.java
-│   │   │   │   │       └── util/
-│   │   │   │   │           ├── FileValidator.java
-│   │   │   │   │           └── VideoIdGenerator.java
-│   │   │   │   └── resources/
-│   │   │   │       ├── application.yml
-│   │   │   │       ├── application-dev.yml
-│   │   │   │       └── application-prod.yml
-│   │   │   └── test/
-│   │   │       └── java/
-│   │   │           └── com/videovault/upload/
-│   │   │               ├── UploadServiceTests.java
-│   │   │               └── S3ServiceTests.java
+│   │   ├── cmd/
+│   │   │   └── upload-service/
+│   │   │       └── main.go
+│   │   ├── internal/
+│   │   │   ├── config/
+│   │   │   │   ├── config.go
+│   │   │   │   └── loader.go
+│   │   │   ├── transport/
+│   │   │   │   └── http/
+│   │   │   │       ├── router.go
+│   │   │   │       ├── handler_upload.go
+│   │   │   │       └── middleware.go
+│   │   │   ├── service/
+│   │   │   │   ├── upload_service.go
+│   │   │   │   ├── object_storage.go # delegates to shared/storage BlobStore
+│   │   │   │   └── kafka_producer.go
+│   │   │   ├── repository/
+│   │   │   │   └── upload_repository.go
+│   │   │   ├── domain/
+│   │   │   │   ├── upload_request.go
+│   │   │   │   ├── upload_response.go
+│   │   │   │   └── video_upload_event.go
+│   │   │   ├── validation/
+│   │   │   │   └── file_validator.go
+│   │   │   ├── errors/
+│   │   │   │   ├── api_errors.go
+│   │   │   │   └── upload_errors.go
+│   │   │   └── observability/
+│   │   │       ├── logger.go
+│   │   │       ├── metrics.go
+│   │   │       └── health.go
+│   │   ├── pkg/
+│   │   │   └── id/
+│   │   │       └── video_id.go
+│   │   ├── configs/
+│   │   │   ├── config.yaml
+│   │   │   ├── config.dev.yaml
+│   │   │   └── config.prod.yaml
+│   │   ├── tests/
+│   │   │   ├── upload_service_test.go
+│   │   │   └── object_storage_test.go
 │   │   ├── Dockerfile
-│   │   ├── pom.xml
+│   │   ├── go.mod
+│   │   ├── go.sum
 │   │   └── README.md
 │   │
 │   ├── encoder-service/
-│   │   ├── src/
-│   │   │   ├── main/
-│   │   │   │   ├── java/
-│   │   │   │   │   └── com/videovault/encoder/
-│   │   │   │   │       ├── EncoderServiceApplication.java
-│   │   │   │   │       ├── config/
-│   │   │   │   │       │   ├── KafkaConsumerConfig.java
-│   │   │   │   │       │   ├── KafkaProducerConfig.java
-│   │   │   │   │       │   └── EncoderConfig.java
-│   │   │   │   │       ├── consumer/
-│   │   │   │   │       │   └── VideoUploadConsumer.java
-│   │   │   │   │       ├── service/
-│   │   │   │   │       │   ├── EncodingService.java
-│   │   │   │   │       │   ├── FFmpegService.java
-│   │   │   │   │       │   ├── S3DownloadService.java
-│   │   │   │   │       │   ├── S3UploadService.java
-│   │   │   │   │       │   └── KafkaProducerService.java
-│   │   │   │   │       ├── model/
-│   │   │   │   │       │   ├── VideoUploadEvent.java
-│   │   │   │   │       │   ├── VideoEncodedEvent.java
-│   │   │   │   │       │   └── EncodingConfig.java
-│   │   │   │   │       ├── exception/
-│   │   │   │   │       │   └── EncodingException.java
-│   │   │   │   │       └── util/
-│   │   │   │   │           ├── FFmpegCommandBuilder.java
-│   │   │   │   │           └── TempFileManager.java
-│   │   │   │   └── resources/
-│   │   │   │       ├── application.yml
-│   │   │   │       └── encoding-profiles.yml
-│   │   │   └── test/
+│   │   ├── cmd/
+│   │   │   └── encoder-service/
+│   │   │       └── main.go
+│   │   ├── internal/
+│   │   │   ├── config/
+│   │   │   │   ├── config.go
+│   │   │   │   └── profiles.go
+│   │   │   ├── transport/
+│   │   │   │   └── kafka/
+│   │   │   │       └── upload_consumer.go
+│   │   │   ├── service/
+│   │   │   │   ├── encoding_service.go
+│   │   │   │   ├── ffmpeg_service.go
+│   │   │   │   ├── blob_download.go   # read raw via BlobStore
+│   │   │   │   ├── blob_upload.go     # write renditions + thumbs via BlobStore
+│   │   │   │   └── event_producer.go
+│   │   │   ├── domain/
+│   │   │   │   ├── video_upload_event.go
+│   │   │   │   ├── video_encoded_event.go
+│   │   │   │   └── encoding_profile.go
+│   │   │   ├── errors/
+│   │   │   │   └── encoding_errors.go
+│   │   │   └── util/
+│   │   │       ├── ffmpeg_command_builder.go
+│   │   │       └── temp_file_manager.go
+│   │   ├── configs/
+│   │   │   ├── config.yaml
+│   │   │   └── encoding-profiles.yaml
+│   │   ├── tests/
 │   │   ├── Dockerfile
-│   │   ├── pom.xml
+│   │   ├── go.mod
+│   │   ├── go.sum
 │   │   └── README.md
 │   │
 │   ├── metadata-service/
-│   │   ├── src/
-│   │   │   ├── main/
-│   │   │   │   ├── java/
-│   │   │   │   │   └── com/videovault/metadata/
-│   │   │   │   │       ├── MetadataServiceApplication.java
-│   │   │   │   │       ├── config/
-│   │   │   │   │       │   ├── DatabaseConfig.java
-│   │   │   │   │       │   ├── GrpcServerConfig.java
-│   │   │   │   │       │   └── KafkaConsumerConfig.java
-│   │   │   │   │       ├── consumer/
-│   │   │   │   │       │   └── VideoEncodedConsumer.java
-│   │   │   │   │       ├── grpc/
-│   │   │   │   │       │   └── MetadataServiceImpl.java
-│   │   │   │   │       ├── service/
-│   │   │   │   │       │   └── MetadataService.java
-│   │   │   │   │       ├── repository/
-│   │   │   │   │       │   ├── VideoRepository.java
-│   │   │   │   │       │   ├── VideoQualityRepository.java
-│   │   │   │   │       │   └── VideoAnalyticsRepository.java
-│   │   │   │   │       ├── entity/
-│   │   │   │   │       │   ├── Video.java
-│   │   │   │   │       │   ├── VideoQuality.java
-│   │   │   │   │       │   └── VideoAnalytics.java
-│   │   │   │   │       ├── mapper/
-│   │   │   │   │       │   └── VideoMetadataMapper.java
-│   │   │   │   │       └── exception/
-│   │   │   │   │           └── MetadataException.java
-│   │   │   │   └── resources/
-│   │   │   │       ├── application.yml
-│   │   │   │       └── db/
-│   │   │   │           └── migration/
-│   │   │   │               ├── V1__create_videos_table.sql
-│   │   │   │               ├── V2__create_video_qualities_table.sql
-│   │   │   │               └── V3__create_video_analytics_table.sql
-│   │   │   └── test/
+│   │   ├── cmd/
+│   │   │   └── metadata-service/
+│   │   │       └── main.go
+│   │   ├── internal/
+│   │   │   ├── config/
+│   │   │   │   └── config.go
+│   │   │   ├── transport/
+│   │   │   │   ├── grpc/
+│   │   │   │   │   └── metadata_server.go
+│   │   │   │   └── kafka/
+│   │   │   │       └── encoded_consumer.go
+│   │   │   ├── service/
+│   │   │   │   └── metadata_service.go
+│   │   │   ├── repository/
+│   │   │   │   ├── video_repository.go
+│   │   │   │   ├── video_quality_repository.go
+│   │   │   │   └── analytics_repository.go
+│   │   │   ├── domain/
+│   │   │   │   ├── video.go
+│   │   │   │   ├── video_quality.go
+│   │   │   │   └── video_analytics.go
+│   │   │   ├── mapper/
+│   │   │   │   └── video_metadata_mapper.go
+│   │   │   └── errors/
+│   │   │       └── metadata_errors.go
+│   │   ├── migrations/
+│   │   │   ├── 001_create_videos_table.sql
+│   │   │   ├── 002_create_video_qualities_table.sql
+│   │   │   └── 003_create_video_analytics_table.sql
+│   │   ├── configs/
+│   │   │   └── config.yaml
+│   │   ├── tests/
 │   │   ├── Dockerfile
-│   │   ├── pom.xml
+│   │   ├── go.mod
+│   │   ├── go.sum
 │   │   └── README.md
 │   │
 │   └── streaming-service/
-│       ├── src/
-│       │   ├── main/
-│       │   │   ├── java/
-│       │   │   │   └── com/videovault/streaming/
-│       │   │   │       ├── StreamingServiceApplication.java
-│       │   │   │       ├── config/
-│       │   │   │       │   ├── GrpcClientConfig.java
-│       │   │   │       │   ├── CdnConfig.java
-│       │   │   │       │   └── CorsConfig.java
-│       │   │   │       ├── controller/
-│       │   │   │       │   └── StreamingController.java
-│       │   │   │       ├── service/
-│       │   │   │       │   ├── StreamingService.java
-│       │   │   │       │   ├── MetadataGrpcClient.java
-│       │   │   │       │   └── UrlGeneratorService.java
-│       │   │   │       ├── model/
-│       │   │   │       │   ├── VideoResponse.java
-│       │   │   │       │   └── StreamingUrl.java
-│       │   │   │       └── exception/
-│       │   │   │           └── StreamingException.java
-│       │   │   └── resources/
-│       │   │       └── application.yml
-│       │   └── test/
+│       ├── cmd/
+│       │   └── streaming-service/
+│       │       └── main.go
+│       ├── internal/
+│       │   ├── config/
+│       │   │   └── config.go
+│       │   ├── transport/
+│       │   │   └── http/
+│       │   │       ├── router.go
+│       │   │       └── handler_streaming.go
+│       │   ├── service/
+│       │   │   ├── streaming_service.go
+│       │   │   ├── metadata_grpc_client.go
+│       │   │   └── url_generator_service.go
+│       │   ├── domain/
+│       │   │   ├── video_response.go
+│       │   │   └── streaming_url.go
+│       │   └── errors/
+│       │       └── streaming_errors.go
+│       ├── configs/
+│       │   └── config.yaml
+│       ├── tests/
 │       ├── Dockerfile
-│       ├── pom.xml
+│       ├── go.mod
+│       ├── go.sum
 │       └── README.md
 │
 ├── frontend/
@@ -642,448 +669,321 @@ videovault/
 
 ### 1. Code Quality & Standards
 
-#### Java/Spring Boot Best Practices
+#### Go Backend Best Practices
 - **Follow SOLID principles**
-- **Use dependency injection** - Let Spring manage your beans
+- **Use constructor-based dependency injection** - Wire dependencies explicitly in `main.go`
 - **Separate concerns** - Controller → Service → Repository pattern
 - **Use DTOs** - Don't expose entities directly in APIs
-- **Implement proper exception handling** - Use @ControllerAdvice for global exception handling
-- **Use Lombok** - Reduce boilerplate with @Data, @Builder, @Slf4j
-- **Write meaningful logs** - Use SLF4J with structured logging
-- **Configuration externalization** - Use application.yml and environment variables
+- **Implement centralized error handling** - Use HTTP middleware for consistent error responses
+- **Write meaningful logs** - Use structured logging (e.g., `zap` or `zerolog`)
+- **Configuration externalization** - Use environment variables and config files (`yaml`/`env`)
 - **API versioning** - Include /api/v1/ in all endpoints
-- **Input validation** - Use @Valid and @Validated with Bean Validation
-- **Use profiles** - dev, test, prod profiles for different environments
+- **Input validation** - Validate request DTOs before business logic
+- **Use environment-based config** - Separate dev, test, prod settings cleanly
 
 #### Example Controller Pattern:
-```java
-@RestController
-@RequestMapping(\"/api/v1/videos\")
-@Slf4j
-@RequiredArgsConstructor
-public class UploadController {
-    
-    private final UploadService uploadService;
-    
-    @PostMapping(\"/upload\")
-    public ResponseEntity<UploadResponse> uploadVideo(
-            @Valid @RequestParam(\"file\") MultipartFile file,
-            @Valid @ModelAttribute VideoMetadataRequest metadata) {
-        
-        log.info(\"Received upload request for video: {}\", metadata.getTitle());
-        
-        try {
-            UploadResponse response = uploadService.processUpload(file, metadata);
-            return ResponseEntity.ok(response);
-        } catch (InvalidFileException e) {
-            log.error(\"Invalid file upload: {}\", e.getMessage());
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
-        }
+```go
+type UploadHandler struct {
+    uploadService *UploadService
+    logger        *zap.Logger
+}
+
+func (h *UploadHandler) UploadVideo(c *gin.Context) {
+    file, err := c.FormFile(\"file\")
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{\"error\": \"file is required\"})
+        return
     }
+
+    var metadata VideoMetadataRequest
+    if err := c.ShouldBind(&metadata); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{\"error\": err.Error()})
+        return
+    }
+
+    h.logger.Info(\"received upload request\", zap.String(\"title\", metadata.Title))
+
+    response, err := h.uploadService.ProcessUpload(c.Request.Context(), file, metadata)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{\"error\": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, response)
 }
 ```
 
 #### Example Service Pattern:
-```java
-@Service
-@Slf4j
-@RequiredArgsConstructor
-public class UploadService {
-    
-    private final S3Service s3Service;
-    private final KafkaProducerService kafkaProducerService;
-    private final VideoValidator videoValidator;
-    
-    @Transactional
-    public UploadResponse processUpload(MultipartFile file, VideoMetadataRequest metadata) {
-        // Validate
-        videoValidator.validate(file);
-        
-        // Generate unique ID
-        String videoId = UUID.randomUUID().toString();
-        
-        // Upload to S3
-        String s3Url = s3Service.uploadRawVideo(videoId, file);
-        log.info(\"Video uploaded to S3: {}\", s3Url);
-        
-        // Produce Kafka event
-        VideoUploadEvent event = VideoUploadEvent.builder()
-                .videoId(videoId)
-                .s3Url(s3Url)
-                .originalFilename(file.getOriginalFilename())
-                .fileSize(file.getSize())
-                .build();
-        
-        kafkaProducerService.sendUploadEvent(event);
-        log.info(\"Upload event produced for video: {}\", videoId);
-        
-        return UploadResponse.builder()
-                .videoId(videoId)
-                .status(\"UPLOADED\")
-                .message(\"Video uploaded successfully\")
-                .build();
+```go
+type UploadService struct {
+    s3Service     S3Service
+    kafkaProducer KafkaProducer
+    validator     VideoValidator
+    logger        *zap.Logger
+}
+
+func (s *UploadService) ProcessUpload(
+    ctx context.Context,
+    file *multipart.FileHeader,
+    metadata VideoMetadataRequest,
+) (*UploadResponse, error) {
+    if err := s.validator.Validate(file); err != nil {
+        return nil, err
     }
+
+    videoID := uuid.NewString()
+
+    s3URL, err := s.s3Service.UploadRawVideo(ctx, videoID, file)
+    if err != nil {
+        return nil, err
+    }
+    s.logger.Info(\"video uploaded to S3\", zap.String(\"s3_url\", s3URL))
+
+    event := VideoUploadEvent{
+        VideoID: videoID,
+        S3URL:   s3URL,
+        Quality: \"source\",
+    }
+
+    if err := s.kafkaProducer.SendUploadEvent(ctx, event); err != nil {
+        return nil, err
+    }
+    s.logger.Info(\"upload event produced\", zap.String(\"video_id\", videoID))
+
+    return &UploadResponse{
+        VideoID: videoID,
+        Status:  \"UPLOADED\",
+        Message: \"Video uploaded successfully\",
+    }, nil
 }
 ```
 
 ### 2. Kafka Best Practices
 
 #### Producer Configuration
-```java
-@Configuration
-public class KafkaProducerConfig {
-    
-    @Bean
-    public ProducerFactory<String, VideoUploadEvent> producerFactory() {
-        Map<String, Object> config = new HashMap<>();
-        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
-        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
-        
-        // Reliability settings
-        config.put(ProducerConfig.ACKS_CONFIG, \"all\"); // Wait for all replicas
-        config.put(ProducerConfig.RETRIES_CONFIG, 3); // Retry failed sends
-        config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true); // Prevent duplicates
-        
-        // Performance settings
-        config.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, \"snappy\");
-        config.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
-        config.put(ProducerConfig.LINGER_MS_CONFIG, 10);
-        
-        return new DefaultKafkaProducerFactory<>(config);
-    }
+```go
+func NewProducer(cfg Config) (sarama.SyncProducer, error) {
+    sc := sarama.NewConfig()
+    sc.Producer.RequiredAcks = sarama.WaitForAll
+    sc.Producer.Retry.Max = 3
+    sc.Producer.Idempotent = true
+    sc.Producer.Compression = sarama.CompressionSnappy
+    sc.Producer.Flush.Bytes = 16384
+    sc.Producer.Flush.Frequency = 10 * time.Millisecond
+    sc.Producer.Return.Successes = true
+
+    return sarama.NewSyncProducer(cfg.Kafka.Brokers, sc)
 }
 ```
 
 #### Consumer Configuration
-```java
-@Configuration
-public class KafkaConsumerConfig {
-    
-    @Bean
-    public ConsumerFactory<String, VideoUploadEvent> consumerFactory() {
-        Map<String, Object> config = new HashMap<>();
-        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
-        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
-        config.put(ConsumerConfig.GROUP_ID_CONFIG, \"encoder-service-group\");
-        
-        // Reliability settings
-        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false); // Manual commit
-        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, \"earliest\");
-        config.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1); // Process one at a time for long-running tasks
-        
-        // Deserialization settings
-        config.put(JsonDeserializer.TRUSTED_PACKAGES, \"com.videovault.*\");
-        config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, VideoUploadEvent.class);
-        
-        return new DefaultKafkaConsumerFactory<>(config);
-    }
+```go
+func NewConsumerGroup(cfg Config) (sarama.ConsumerGroup, error) {
+    sc := sarama.NewConfig()
+    sc.Consumer.Group.Rebalance.Strategy = sarama.NewBalanceStrategyRoundRobin()
+    sc.Consumer.Offsets.AutoCommit.Enable = false
+    sc.Consumer.Offsets.Initial = sarama.OffsetOldest
+    sc.Consumer.Fetch.Default = 1 * 1024 * 1024
+
+    return sarama.NewConsumerGroup(cfg.Kafka.Brokers, "encoder-service-group", sc)
 }
 ```
 
 #### Consumer Implementation with Error Handling
-```java
-@Service
-@Slf4j
-@RequiredArgsConstructor
-public class VideoUploadConsumer {
-    
-    private final EncodingService encodingService;
-    
-    @KafkaListener(topics = \"uploaded-videos\", groupId = \"encoder-service-group\")
-    public void consume(
-            @Payload VideoUploadEvent event,
-            @Header(KafkaHeaders.RECEIVED_PARTITION_ID) int partition,
-            Acknowledgment acknowledgment) {
-        
-        log.info(\"Received video upload event: videoId={}, partition={}\", 
-                event.getVideoId(), partition);
-        
-        try {
-            // Process the video
-            encodingService.encodeVideo(event);
-            
-            // Manually commit offset only after successful processing
-            acknowledgment.acknowledge();
-            log.info(\"Successfully processed video: {}\", event.getVideoId());
-            
-        } catch (Exception e) {
-            log.error(\"Failed to process video: {}\", event.getVideoId(), e);
-            // Don't acknowledge - message will be redelivered
-            // Consider implementing Dead Letter Queue (DLQ) after max retries
+```go
+type UploadConsumer struct {
+    encodingService *EncodingService
+    logger          *zap.Logger
+}
+
+func (c *UploadConsumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+    for msg := range claim.Messages() {
+        var event VideoUploadEvent
+        if err := json.Unmarshal(msg.Value, &event); err != nil {
+            c.logger.Error("invalid event payload", zap.Error(err))
+            continue
         }
+
+        if err := c.encodingService.EncodeVideo(session.Context(), event); err != nil {
+            c.logger.Error("failed to process video", zap.String("video_id", event.VideoID), zap.Error(err))
+            continue
+        }
+
+        session.MarkMessage(msg, "processed")
     }
+    return nil
 }
 ```
+
 
 ### 3. FFmpeg Integration Best Practices
 
 #### FFmpeg Service Implementation
-```java
-@Service
-@Slf4j
-public class FFmpegService {
-    
-    public void encodeVideo(String inputPath, String outputPath, EncodingProfile profile) {
-        List<String> command = buildFFmpegCommand(inputPath, outputPath, profile);
-        
-        try {
-            ProcessBuilder processBuilder = new ProcessBuilder(command);
-            processBuilder.redirectErrorStream(true);
-            
-            Process process = processBuilder.start();
-            
-            // Monitor progress
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    log.debug(\"FFmpeg output: {}\", line);
-                    // Parse progress from FFmpeg output if needed
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            
-            if (exitCode != 0) {
-                throw new EncodingException(\"FFmpeg encoding failed with exit code: \" + exitCode);
-            }
-            
-            log.info(\"Video encoded successfully: {}\", outputPath);
-            
-        } catch (IOException | InterruptedException e) {
-            log.error(\"Error during video encoding\", e);
-            throw new EncodingException(\"Video encoding failed\", e);
-        }
+```go
+func (s *FFmpegService) EncodeVideo(ctx context.Context, inputPath, outputPath string, profile EncodingProfile) error {
+    args := []string{
+        "-i", inputPath,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", strconv.Itoa(profile.CRF),
+        "-vf", fmt.Sprintf("scale=%d:%d", profile.Width, profile.Height),
+        "-b:v", profile.VideoBitrate,
+        "-maxrate", profile.MaxBitrate,
+        "-bufsize", profile.BufferSize,
+        "-c:a", "aac",
+        "-b:a", profile.AudioBitrate,
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        outputPath,
     }
-    
-    private List<String> buildFFmpegCommand(String input, String output, EncodingProfile profile) {
-        List<String> command = new ArrayList<>();
-        command.add(\"ffmpeg\");
-        command.add(\"-i\");
-        command.add(input);
-        
-        // Video codec settings
-        command.add(\"-c:v\");
-        command.add(\"libx264\");
-        command.add(\"-preset\");
-        command.add(\"medium\"); // balance between speed and quality
-        command.add(\"-crf\");
-        command.add(String.valueOf(profile.getCrf()));
-        
-        // Resolution and bitrate
-        command.add(\"-vf\");
-        command.add(String.format(\"scale=%d:%d\", profile.getWidth(), profile.getHeight()));
-        command.add(\"-b:v\");
-        command.add(profile.getVideoBitrate());
-        command.add(\"-maxrate\");
-        command.add(profile.getMaxBitrate());
-        command.add(\"-bufsize\");
-        command.add(profile.getBufferSize());
-        
-        // Audio codec settings
-        command.add(\"-c:a\");
-        command.add(\"aac\");
-        command.add(\"-b:a\");
-        command.add(profile.getAudioBitrate());
-        command.add(\"-ar\");
-        command.add(\"48000\"); // Sample rate
-        
-        // Format settings
-        command.add(\"-movflags\");
-        command.add(\"+faststart\"); // Enable progressive download
-        command.add(\"-f\");
-        command.add(\"mp4\");
-        
-        command.add(output);
-        
-        return command;
+
+    cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        s.logger.Error("ffmpeg failed", zap.ByteString("output", output), zap.Error(err))
+        return fmt.Errorf("encode video: %w", err)
     }
+
+    s.logger.Info("video encoded successfully", zap.String("path", outputPath))
+    return nil
 }
 ```
 
 #### Encoding Profile Configuration
-```java
-@Configuration
-@ConfigurationProperties(prefix = \"encoding\")
-@Data
-public class EncodingConfig {
-    private Map<String, EncodingProfile> profiles;
+```go
+type EncodingConfig struct {
+    Profiles map[string]EncodingProfile `mapstructure:"profiles" yaml:"profiles"`
 }
 
-@Data
-@Builder
-public class EncodingProfile {
-    private String quality;
-    private int width;
-    private int height;
-    private String videoBitrate;
-    private String maxBitrate;
-    private String bufferSize;
-    private String audioBitrate;
-    private int crf;
+type EncodingProfile struct {
+    Quality      string `mapstructure:"quality" yaml:"quality"`
+    Width        int    `mapstructure:"width" yaml:"width"`
+    Height       int    `mapstructure:"height" yaml:"height"`
+    VideoBitrate string `mapstructure:"video_bitrate" yaml:"video_bitrate"`
+    MaxBitrate   string `mapstructure:"max_bitrate" yaml:"max_bitrate"`
+    BufferSize   string `mapstructure:"buffer_size" yaml:"buffer_size"`
+    AudioBitrate string `mapstructure:"audio_bitrate" yaml:"audio_bitrate"`
+    CRF          int    `mapstructure:"crf" yaml:"crf"`
 }
 ```
 
 ```yaml
-# application.yml
+# config.yaml
 encoding:
   profiles:
     1080p:
       quality: \"1080p\"
       width: 1920
       height: 1080
-      video-bitrate: \"5000k\"
-      max-bitrate: \"5350k\"
-      buffer-size: \"7500k\"
-      audio-bitrate: \"192k\"
+      video_bitrate: \"5000k\"
+      max_bitrate: \"5350k\"
+      buffer_size: \"7500k\"
+      audio_bitrate: \"192k\"
       crf: 23
     720p:
       quality: \"720p\"
       width: 1280
       height: 720
-      video-bitrate: \"2500k\"
-      max-bitrate: \"2675k\"
-      buffer-size: \"3750k\"
-      audio-bitrate: \"128k\"
+      video_bitrate: \"2500k\"
+      max_bitrate: \"2675k\"
+      buffer_size: \"3750k\"
+      audio_bitrate: \"128k\"
       crf: 23
     480p:
       quality: \"480p\"
       width: 854
       height: 480
-      video-bitrate: \"1000k\"
-      max-bitrate: \"1070k\"
-      buffer-size: \"1500k\"
-      audio-bitrate: \"96k\"
+      video_bitrate: \"1000k\"
+      max_bitrate: \"1070k\"
+      buffer_size: \"1500k\"
+      audio_bitrate: \"96k\"
       crf: 23
 ```
 
 ### 4. gRPC Implementation Best Practices
 
 #### Server Implementation
-```java
-@GrpcService
-@Slf4j
-@RequiredArgsConstructor
-public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImplBase {
-    
-    private final MetadataService metadataService;
-    private final VideoMetadataMapper mapper;
-    
-    @Override
-    public void storeMetadata(VideoMetadataProto.VideoMetadata request,
-                            StreamObserver<VideoMetadataProto.MetadataResponse> responseObserver) {
-        try {
-            log.info(\"Received store metadata request for video: {}\", request.getVideoId());
-            
-            Video video = mapper.toEntity(request);
-            metadataService.saveMetadata(video);
-            
-            VideoMetadataProto.MetadataResponse response = VideoMetadataProto.MetadataResponse
-                    .newBuilder()
-                    .setSuccess(true)
-                    .setMessage(\"Metadata stored successfully\")
-                    .build();
-            
-            responseObserver.onNext(response);
-            responseObserver.onCompleted();
-            
-        } catch (Exception e) {
-            log.error(\"Error storing metadata\", e);
-            responseObserver.onError(Status.INTERNAL
-                    .withDescription(\"Failed to store metadata: \" + e.getMessage())
-                    .asRuntimeException());
-        }
+```go
+type MetadataServer struct {
+    pb.UnimplementedMetadataServiceServer
+    metadataService *MetadataService
+    mapper          *VideoMetadataMapper
+    logger          *zap.Logger
+}
+
+func (s *MetadataServer) StoreMetadata(ctx context.Context, req *pb.VideoMetadata) (*pb.MetadataResponse, error) {
+    s.logger.Info("store metadata request", zap.String("video_id", req.VideoId))
+
+    video := s.mapper.ToDomain(req)
+    if err := s.metadataService.SaveMetadata(ctx, video); err != nil {
+        return nil, status.Errorf(codes.Internal, "failed to store metadata: %v", err)
     }
-    
-    @Override
-    public void getVideoById(VideoMetadataProto.VideoIdRequest request,
-                           StreamObserver<VideoMetadataProto.VideoMetadata> responseObserver) {
-        try {
-            String videoId = request.getVideoId();
-            log.info(\"Received get video request: {}\", videoId);
-            
-            Video video = metadataService.getVideoById(videoId)
-                    .orElseThrow(() -> new VideoNotFoundException(\"Video not found: \" + videoId));
-            
-            VideoMetadataProto.VideoMetadata response = mapper.toProto(video);
-            
-            responseObserver.onNext(response);
-            responseObserver.onCompleted();
-            
-        } catch (VideoNotFoundException e) {
-            log.error(\"Video not found\", e);
-            responseObserver.onError(Status.NOT_FOUND
-                    .withDescription(e.getMessage())
-                    .asRuntimeException());
-        } catch (Exception e) {
-            log.error(\"Error retrieving video\", e);
-            responseObserver.onError(Status.INTERNAL
-                    .withDescription(\"Failed to retrieve video\")
-                    .asRuntimeException());
+
+    return &pb.MetadataResponse{Success: true, Message: "Metadata stored successfully"}, nil
+}
+
+func (s *MetadataServer) GetVideoById(ctx context.Context, req *pb.VideoIdRequest) (*pb.VideoMetadata, error) {
+    video, err := s.metadataService.GetVideoByID(ctx, req.VideoId)
+    if err != nil {
+        if errors.Is(err, ErrVideoNotFound) {
+            return nil, status.Error(codes.NotFound, err.Error())
         }
+        return nil, status.Error(codes.Internal, "failed to retrieve video")
     }
+
+    return s.mapper.ToProto(video), nil
 }
 ```
 
 #### Client Implementation
-```java
-@Service
-@Slf4j
-public class MetadataGrpcClient {
-    
-    private final MetadataServiceGrpc.MetadataServiceBlockingStub blockingStub;
-    
-    public MetadataGrpcClient(
-            @Value(\"${grpc.metadata-service.host}\") String host,
-            @Value(\"${grpc.metadata-service.port}\") int port) {
-        
-        ManagedChannel channel = ManagedChannelBuilder
-                .forAddress(host, port)
-                .usePlaintext() // Use TLS in production
-                .build();
-        
-        this.blockingStub = MetadataServiceGrpc.newBlockingStub(channel);
+```go
+type MetadataGRPCClient struct {
+    conn   *grpc.ClientConn
+    client pb.MetadataServiceClient
+}
+
+func NewMetadataGRPCClient(host string, port int) (*MetadataGRPCClient, error) {
+    addr := fmt.Sprintf("%s:%d", host, port)
+    conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+    if err != nil {
+        return nil, fmt.Errorf("dial metadata service: %w", err)
     }
-    
-    public VideoMetadata getVideoById(String videoId) {
-        try {
-            VideoMetadataProto.VideoIdRequest request = VideoMetadataProto.VideoIdRequest
-                    .newBuilder()
-                    .setVideoId(videoId)
-                    .build();
-            
-            VideoMetadataProto.VideoMetadata response = blockingStub.getVideoById(request);
-            
-            return mapToVideoMetadata(response);
-            
-        } catch (StatusRuntimeException e) {
-            log.error(\"gRPC call failed: {}\", e.getStatus(), e);
-            throw new MetadataServiceException(\"Failed to fetch video metadata\", e);
-        }
+
+    return &MetadataGRPCClient{conn: conn, client: pb.NewMetadataServiceClient(conn)}, nil
+}
+
+func (c *MetadataGRPCClient) GetVideoByID(ctx context.Context, videoID string) (*VideoMetadata, error) {
+    resp, err := c.client.GetVideoById(ctx, &pb.VideoIdRequest{VideoId: videoID})
+    if err != nil {
+        return nil, fmt.Errorf("grpc get video by id: %w", err)
     }
+    return mapToVideoMetadata(resp), nil
 }
 ```
 
+
 ### 5. Docker & Containerization Best Practices
 
-#### Multi-Stage Dockerfile for Spring Boot
+#### Multi-Stage Dockerfile for Go Services
 ```dockerfile
 # Build stage
-FROM maven:3.9-eclipse-temurin-21 AS build
+FROM golang:1.22-alpine AS build
 WORKDIR /app
 
-# Copy pom.xml and download dependencies (cached layer)
-COPY pom.xml .
-RUN mvn dependency:go-offline -B
+# Install build dependencies
+RUN apk add --no-cache git
 
-# Copy source and build
-COPY src ./src
-RUN mvn clean package -DskipTests
+# Copy go module files first for caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and build static binary
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/service ./cmd/service
 
 # Runtime stage
-FROM eclipse-temurin:21-jre-alpine
+FROM alpine:3.20
 WORKDIR /app
 
 # Install FFmpeg (for encoder service only)
@@ -1093,8 +993,8 @@ RUN apk add --no-cache ffmpeg
 RUN addgroup -g 1001 -S appuser && \\
     adduser -u 1001 -S appuser -G appuser
 
-# Copy JAR from build stage
-COPY --from=build /app/target/*.jar app.jar
+# Copy binary from build stage
+COPY --from=build /bin/service /app/service
 
 # Change ownership
 RUN chown -R appuser:appuser /app
@@ -1104,13 +1004,13 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \\
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1
 
 # Expose port
 EXPOSE 8080
 
 # Run application
-ENTRYPOINT [\"java\", \"-XX:+UseContainerSupport\", \"-XX:MaxRAMPercentage=75.0\", \"-jar\", \"app.jar\"]
+ENTRYPOINT [\"/app/service\"]
 ```
 
 #### Docker Compose for Local Development
@@ -1185,7 +1085,7 @@ services:
     ports:
       - \"8081:8080\"
     environment:
-      SPRING_PROFILES_ACTIVE: dev
+      APP_ENV: dev
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       AWS_S3_ENDPOINT: http://localstack:4566
       AWS_ACCESS_KEY_ID: test
@@ -1202,7 +1102,7 @@ services:
     deploy:
       replicas: 3  # Run 3 instances for parallel encoding
     environment:
-      SPRING_PROFILES_ACTIVE: dev
+      APP_ENV: dev
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       AWS_S3_ENDPOINT: http://localstack:4566
       AWS_ACCESS_KEY_ID: test
@@ -1221,10 +1121,8 @@ services:
       - \"8082:8080\"
       - \"9090:9090\"  # gRPC port
     environment:
-      SPRING_PROFILES_ACTIVE: dev
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/videovault
-      SPRING_DATASOURCE_USERNAME: videovault_user
-      SPRING_DATASOURCE_PASSWORD: videovault_pass
+      APP_ENV: dev
+      DATABASE_URL: postgres://videovault_user:videovault_pass@postgres:5432/videovault?sslmode=disable
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       GRPC_SERVER_PORT: 9090
     depends_on:
@@ -1239,7 +1137,7 @@ services:
     ports:
       - \"8083:8080\"
     environment:
-      SPRING_PROFILES_ACTIVE: dev
+      APP_ENV: dev
       GRPC_METADATA_SERVICE_HOST: metadata-service
       GRPC_METADATA_SERVICE_PORT: 9090
       AWS_S3_ENDPOINT: http://localstack:4566
@@ -1275,135 +1173,68 @@ networks:
 
 ### 6. Database Best Practices
 
-#### JPA Entity Example
-```java
-@Entity
-@Table(name = \"videos\", indexes = {
-    @Index(name = \"idx_uploader\", columnList = \"uploader_id\"),
-    @Index(name = \"idx_status\", columnList = \"processing_status\")
-})
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class Video {
-    
-    @Id
-    @Column(name = \"video_id\", length = 36)
-    private String videoId;
-    
-    @Column(nullable = false, length = 255)
-    private String title;
-    
-    @Column(columnDefinition = \"TEXT\")
-    private String description;
-    
-    @Column(name = \"uploader_id\", nullable = false, length = 36)
-    private String uploaderId;
-    
-    @Column(name = \"original_filename\", length = 255)
-    private String originalFilename;
-    
-    @Column(name = \"duration_seconds\")
-    private Integer durationSeconds;
-    
-    @Column(name = \"original_size_bytes\")
-    private Long originalSizeBytes;
-    
-    @Column(name = \"processing_status\", length = 50)
-    @Enumerated(EnumType.STRING)
-    private ProcessingStatus processingStatus;
-    
-    @Column(name = \"thumbnail_url\", length = 500)
-    private String thumbnailUrl;
-    
-    @OneToMany(mappedBy = \"video\", cascade = CascadeType.ALL, orphanRemoval = true)
-    private List<VideoQuality> qualities = new ArrayList<>();
-    
-    @OneToOne(mappedBy = \"video\", cascade = CascadeType.ALL, orphanRemoval = true)
-    private VideoAnalytics analytics;
-    
-    @Column(name = \"created_at\", nullable = false, updatable = false)
-    @CreationTimestamp
-    private LocalDateTime createdAt;
-    
-    @Column(name = \"updated_at\")
-    @UpdateTimestamp
-    private LocalDateTime updatedAt;
-    
-    public void addQuality(VideoQuality quality) {
-        qualities.add(quality);
-        quality.setVideo(this);
-    }
+#### Go Domain Model + Persistence Example
+```go
+type Video struct {
+    VideoID         string    `db:"video_id"`
+    Title           string    `db:"title"`
+    Description     string    `db:"description"`
+    UploaderID      string    `db:"uploader_id"`
+    OriginalName    string    `db:"original_filename"`
+    DurationSeconds int       `db:"duration_seconds"`
+    OriginalSize    int64     `db:"original_size_bytes"`
+    ProcessingState string    `db:"processing_status"`
+    ThumbnailURL    string    `db:"thumbnail_url"`
+    CreatedAt       time.Time `db:"created_at"`
+    UpdatedAt       time.Time `db:"updated_at"`
 }
 
-@Entity
-@Table(name = \"video_qualities\")
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class VideoQuality {
-    
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = \"quality_id\")
-    private Long qualityId;
-    
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = \"video_id\", nullable = false)
-    private Video video;
-    
-    @Column(name = \"quality_level\", nullable = false, length = 10)
-    private String qualityLevel;
-    
-    @Column(name = \"s3_url\", nullable = false, length = 500)
-    private String s3Url;
-    
-    @Column(name = \"file_size_bytes\")
-    private Long fileSizeBytes;
-    
-    @Column(name = \"bitrate_kbps\")
-    private Integer bitrateKbps;
-    
-    @Column(name = \"encoding_status\", length = 50)
-    @Enumerated(EnumType.STRING)
-    private EncodingStatus encodingStatus;
-    
-    @Column(name = \"encoded_at\")
-    private LocalDateTime encodedAt;
-    
-    @Column(name = \"created_at\", nullable = false, updatable = false)
-    @CreationTimestamp
-    private LocalDateTime createdAt;
+type VideoQuality struct {
+    QualityID    int64      `db:"quality_id"`
+    VideoID      string     `db:"video_id"`
+    QualityLevel string     `db:"quality_level"`
+    PlaybackURL  string     `db:"playback_url"`
+    FileSize     int64      `db:"file_size_bytes"`
+    BitrateKbps  int        `db:"bitrate_kbps"`
+    Status       string     `db:"encoding_status"`
+    EncodedAt    *time.Time `db:"encoded_at"`
+    CreatedAt    time.Time  `db:"created_at"`
 }
 ```
 
 #### Repository with Custom Queries
-```java
-@Repository
-public interface VideoRepository extends JpaRepository<Video, String> {
-    
-    @Query(\"SELECT v FROM Video v WHERE v.uploaderId = :uploaderId \" +
-           \"ORDER BY v.createdAt DESC\")
-    Page<Video> findByUploaderId(@Param(\"uploaderId\") String uploaderId, Pageable pageable);
-    
-    @Query(\"SELECT v FROM Video v WHERE v.processingStatus = :status\")
-    List<Video> findByProcessingStatus(@Param(\"status\") ProcessingStatus status);
-    
-    @Query(\"SELECT v FROM Video v LEFT JOIN FETCH v.qualities \" +
-           \"WHERE v.videoId = :videoId\")
-    Optional<Video> findByIdWithQualities(@Param(\"videoId\") String videoId);
-    
-    @Modifying
-    @Query(\"UPDATE Video v SET v.processingStatus = :status \" +
-           \"WHERE v.videoId = :videoId\")
-    void updateStatus(@Param(\"videoId\") String videoId, 
-                     @Param(\"status\") ProcessingStatus status);
+```go
+type VideoRepository struct {
+    db *sql.DB
+}
+
+func (r *VideoRepository) FindByUploaderID(ctx context.Context, uploaderID string, limit, offset int) ([]Video, error) {
+    query := `
+        SELECT * FROM videos
+        WHERE uploader_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3`
+
+    rows, err := r.db.QueryContext(ctx, query, uploaderID, limit, offset)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    return scanVideos(rows)
+}
+
+func (r *VideoRepository) UpdateStatus(ctx context.Context, videoID, status string) error {
+    _, err := r.db.ExecContext(ctx,
+        `UPDATE videos SET processing_status = $1, updated_at = NOW() WHERE video_id = $2`,
+        status, videoID,
+    )
+    return err
 }
 ```
 
-#### Flyway Migration Best Practices
+
+#### SQL Migration Best Practices
 ```sql
 -- V1__create_videos_table.sql
 CREATE TABLE IF NOT EXISTS videos (
@@ -1429,7 +1260,7 @@ CREATE TABLE IF NOT EXISTS video_qualities (
     quality_id SERIAL PRIMARY KEY,
     video_id VARCHAR(36) NOT NULL REFERENCES videos(video_id) ON DELETE CASCADE,
     quality_level VARCHAR(10) NOT NULL,
-    s3_url VARCHAR(500) NOT NULL,
+    playback_url VARCHAR(500) NOT NULL, -- historically s3_url; stores any backend’s URL or resolvable path
     file_size_bytes BIGINT,
     bitrate_kbps INTEGER,
     encoding_status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
@@ -1443,427 +1274,321 @@ CREATE INDEX idx_qualities_status ON video_qualities(encoding_status);
 
 ### 7. Error Handling & Resilience
 
-#### Global Exception Handler
-```java
-@RestControllerAdvice
-@Slf4j
-public class GlobalExceptionHandler {
-    
-    @ExceptionHandler(InvalidFileException.class)
-    public ResponseEntity<ErrorResponse> handleInvalidFile(InvalidFileException ex) {
-        log.error(\"Invalid file upload: {}\", ex.getMessage());
-        ErrorResponse error = ErrorResponse.builder()
-                .status(HttpStatus.BAD_REQUEST.value())
-                .error(\"Invalid File\")
-                .message(ex.getMessage())
-                .timestamp(LocalDateTime.now())
-                .build();
-        return ResponseEntity.badRequest().body(error);
-    }
-    
-    @ExceptionHandler(VideoNotFoundException.class)
-    public ResponseEntity<ErrorResponse> handleVideoNotFound(VideoNotFoundException ex) {
-        log.error(\"Video not found: {}\", ex.getMessage());
-        ErrorResponse error = ErrorResponse.builder()
-                .status(HttpStatus.NOT_FOUND.value())
-                .error(\"Video Not Found\")
-                .message(ex.getMessage())
-                .timestamp(LocalDateTime.now())
-                .build();
-        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(error);
-    }
-    
-    @ExceptionHandler(EncodingException.class)
-    public ResponseEntity<ErrorResponse> handleEncodingError(EncodingException ex) {
-        log.error(\"Encoding error: {}\", ex.getMessage(), ex);
-        ErrorResponse error = ErrorResponse.builder()
-                .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
-                .error(\"Encoding Failed\")
-                .message(\"Video encoding failed. Please try again.\")
-                .timestamp(LocalDateTime.now())
-                .build();
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(error);
-    }
-    
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ErrorResponse> handleGeneralError(Exception ex) {
-        log.error(\"Unexpected error: {}\", ex.getMessage(), ex);
-        ErrorResponse error = ErrorResponse.builder()
-                .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
-                .error(\"Internal Server Error\")
-                .message(\"An unexpected error occurred\")
-                .timestamp(LocalDateTime.now())
-                .build();
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(error);
-    }
+#### Global Error Handler
+```go
+type ErrorResponse struct {
+    Status    int       `json:"status"`
+    Error     string    `json:"error"`
+    Message   string    `json:"message"`
+    Timestamp time.Time `json:"timestamp"`
 }
 
-@Data
-@Builder
-class ErrorResponse {
-    private int status;
-    private String error;
-    private String message;
-    private LocalDateTime timestamp;
+func ErrorMiddleware(logger *zap.Logger) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        c.Next()
+
+        if len(c.Errors) == 0 {
+            return
+        }
+
+        err := c.Errors.Last().Err
+        status := http.StatusInternalServerError
+        errName := "Internal Server Error"
+        msg := "An unexpected error occurred"
+
+        switch {
+        case errors.Is(err, ErrInvalidFile):
+            status = http.StatusBadRequest
+            errName = "Invalid File"
+            msg = err.Error()
+        case errors.Is(err, ErrVideoNotFound):
+            status = http.StatusNotFound
+            errName = "Video Not Found"
+            msg = err.Error()
+        case errors.Is(err, ErrEncodingFailed):
+            status = http.StatusInternalServerError
+            errName = "Encoding Failed"
+            msg = "Video encoding failed. Please try again."
+        }
+
+        logger.Error("request failed", zap.Int("status", status), zap.Error(err))
+        c.JSON(status, ErrorResponse{Status: status, Error: errName, Message: msg, Timestamp: time.Now().UTC()})
+    }
 }
 ```
 
-#### Retry Logic with Resilience4j
-```java
-@Service
-@Slf4j
-@RequiredArgsConstructor
-public class S3ServiceWithRetry {
-    
-    private final AmazonS3 s3Client;
-    
-    @Retry(name = \"s3Upload\", fallbackMethod = \"uploadFallback\")
-    @CircuitBreaker(name = \"s3Upload\")
-    public String uploadFile(String bucketName, String key, File file) {
-        log.info(\"Attempting to upload file to S3: {}/{}\", bucketName, key);
-        
-        PutObjectRequest request = new PutObjectRequest(bucketName, key, file);
-        s3Client.putObject(request);
-        
-        return s3Client.getUrl(bucketName, key).toString();
-    }
-    
-    private String uploadFallback(String bucketName, String key, File file, Exception e) {
-        log.error(\"Failed to upload to S3 after retries: {}/{}\", bucketName, key, e);
-        throw new S3UploadException(\"Failed to upload file to S3\", e);
-    }
+#### Retry + Circuit Breaker Logic
+```go
+retryPolicy := retry.NewExponential(3, 1*time.Second)
+cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+    Name:        "s3Upload",
+    MaxRequests: 3,
+    Interval:    10 * time.Second,
+    Timeout:     10 * time.Second,
+    ReadyToTrip: func(counts gobreaker.Counts) bool {
+        if counts.Requests < 5 {
+            return false
+        }
+        failureRate := float64(counts.TotalFailures) / float64(counts.Requests)
+        return failureRate >= 0.5
+    },
+})
+
+func (s *S3Service) UploadFile(ctx context.Context, bucketName, key string, filePath string) (string, error) {
+    var url string
+    err := retryPolicy.Do(ctx, func() error {
+        _, err := cb.Execute(func() (any, error) {
+            uploadedURL, uploadErr := s.uploadOnce(ctx, bucketName, key, filePath)
+            if uploadErr != nil {
+                return nil, uploadErr
+            }
+            url = uploadedURL
+            return nil, nil
+        })
+        return err
+    })
+    return url, err
 }
 ```
 
 ```yaml
-# application.yml - Resilience4j Configuration
-resilience4j:
-  retry:
-    instances:
-      s3Upload:
-        max-attempts: 3
-        wait-duration: 1s
-        exponential-backoff-multiplier: 2
-        retry-exceptions:
-          - com.amazonaws.SdkClientException
-          - java.io.IOException
-  
-  circuitbreaker:
-    instances:
-      s3Upload:
-        register-health-indicator: true
-        sliding-window-size: 10
-        minimum-number-of-calls: 5
-        permitted-number-of-calls-in-half-open-state: 3
-        wait-duration-in-open-state: 10s
-        failure-rate-threshold: 50
-        automatic-transition-from-open-to-half-open-enabled: true
+# config.yaml
+resilience:
+  s3_upload:
+    retry:
+      max_attempts: 3
+      initial_wait: 1s
+      backoff_multiplier: 2
+    circuit_breaker:
+      sliding_window_size: 10
+      minimum_calls: 5
+      half_open_allowed_calls: 3
+      open_state_wait: 10s
+      failure_rate_threshold: 0.5
 ```
+
 
 ### 8. Monitoring & Observability
 
-#### Spring Boot Actuator Configuration
+#### Go Health + Metrics Configuration
 ```yaml
-# application.yml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,prometheus
-  endpoint:
-    health:
-      show-details: always
-  metrics:
-    tags:
-      application: ${spring.application.name}
-  health:
-    kafka:
-      enabled: true
-    db:
-      enabled: true
+# config.yaml
+service:
+  name: upload-service
+  http_port: 8080
+
+observability:
+  health_endpoint: /healthz
+  ready_endpoint: /readyz
+  metrics_endpoint: /metrics
+
+dependencies:
+  kafka_health_check: true
+  db_health_check: true
 ```
 
 #### Custom Health Indicators
-```java
-@Component
-public class S3HealthIndicator implements HealthIndicator {
-    
-    private final AmazonS3 s3Client;
-    private final String bucketName;
-    
-    @Override
-    public Health health() {
-        try {
-            boolean bucketExists = s3Client.doesBucketExistV2(bucketName);
-            if (bucketExists) {
-                return Health.up()
-                        .withDetail(\"bucket\", bucketName)
-                        .withDetail(\"status\", \"accessible\")
-                        .build();
-            } else {
-                return Health.down()
-                        .withDetail(\"bucket\", bucketName)
-                        .withDetail(\"status\", \"not found\")
-                        .build();
-            }
-        } catch (Exception e) {
-            return Health.down()
-                    .withDetail(\"bucket\", bucketName)
-                    .withDetail(\"error\", e.getMessage())
-                    .build();
+```go
+func S3HealthHandler(s3Client *s3.Client, bucketName string) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        _, err := s3Client.HeadBucket(c.Request.Context(), &s3.HeadBucketInput{Bucket: aws.String(bucketName)})
+        if err != nil {
+            c.JSON(http.StatusServiceUnavailable, gin.H{
+                "status": "down",
+                "bucket": bucketName,
+                "error":  err.Error(),
+            })
+            return
         }
+
+        c.JSON(http.StatusOK, gin.H{
+            "status": "up",
+            "bucket": bucketName,
+        })
     }
 }
 ```
 
 #### Structured Logging with Correlation IDs
-```java
-@Component
-@Slf4j
-public class CorrelationIdFilter implements Filter {
-    
-    private static final String CORRELATION_ID_HEADER = \"X-Correlation-ID\";
-    private static final String CORRELATION_ID_LOG_VAR = \"correlationId\";
-    
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, 
-                        FilterChain chain) throws IOException, ServletException {
-        
-        HttpServletRequest httpRequest = (HttpServletRequest) request;
-        String correlationId = httpRequest.getHeader(CORRELATION_ID_HEADER);
-        
-        if (correlationId == null || correlationId.isEmpty()) {
-            correlationId = UUID.randomUUID().toString();
+```go
+func CorrelationIDMiddleware(logger *zap.Logger) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        correlationID := c.GetHeader("X-Correlation-ID")
+        if correlationID == "" {
+            correlationID = uuid.NewString()
         }
-        
-        MDC.put(CORRELATION_ID_LOG_VAR, correlationId);
-        
-        try {
-            HttpServletResponse httpResponse = (HttpServletResponse) response;
-            httpResponse.setHeader(CORRELATION_ID_HEADER, correlationId);
-            chain.doFilter(request, response);
-        } finally {
-            MDC.remove(CORRELATION_ID_LOG_VAR);
-        }
+
+        c.Writer.Header().Set("X-Correlation-ID", correlationID)
+        requestLogger := logger.With(zap.String("correlation_id", correlationID))
+
+        c.Set("logger", requestLogger)
+        c.Next()
     }
 }
 ```
 
-```xml
-<!-- logback-spring.xml -->
-<configuration>
-    <appender name=\"CONSOLE\" class=\"ch.qos.logback.core.ConsoleAppender\">
-        <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{correlationId}] %-5level %logger{36} - %msg%n</pattern>
-        </encoder>
-    </appender>
-    
-    <appender name=\"FILE\" class=\"ch.qos.logback.core.rolling.RollingFileAppender\">
-        <file>logs/application.log</file>
-        <rollingPolicy class=\"ch.qos.logback.core.rolling.TimeBasedRollingPolicy\">
-            <fileNamePattern>logs/application-%d{yyyy-MM-dd}.log</fileNamePattern>
-            <maxHistory>30</maxHistory>
-        </rollingPolicy>
-        <encoder class=\"net.logstash.logback.encoder.LogstashEncoder\"/>
-    </appender>
-    
-    <root level=\"INFO\">
-        <appender-ref ref=\"CONSOLE\"/>
-        <appender-ref ref=\"FILE\"/>
-    </root>
-</configuration>
+```yaml
+# observability logging config
+logging:
+  level: info
+  format: json
+  output: stdout
 ```
+
 
 ### 9. Security Best Practices
 
 #### Basic Security Configuration
-```java
-@Configuration
-@EnableWebSecurity
-public class SecurityConfig {
-    
-    @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        http
-            .csrf().disable() // For development; enable in production with proper token handling
-            .cors().and()
-            .authorizeHttpRequests(auth -> auth
-                .requestMatchers(\"/api/v1/videos/upload\").authenticated()
-                .requestMatchers(\"/api/v1/stream/**\").permitAll()
-                .requestMatchers(\"/actuator/health\").permitAll()
-                .anyRequest().authenticated()
-            )
-            .oauth2ResourceServer().jwt(); // If using JWT authentication
-        
-        return http.build();
-    }
-    
-    @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
-        CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOrigins(Arrays.asList(\"http://localhost:3000\"));
-        configuration.setAllowedMethods(Arrays.asList(\"GET\", \"POST\", \"PUT\", \"DELETE\", \"OPTIONS\"));
-        configuration.setAllowedHeaders(Arrays.asList(\"*\"));
-        configuration.setAllowCredentials(true);
-        
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration(\"/**\", configuration);
-        return source;
+```go
+func AuthAndCorsMiddleware(cfg Config) gin.HandlerFunc {
+    allowedOrigins := map[string]struct{}{"http://localhost:3000": {}}
+
+    return func(c *gin.Context) {
+        origin := c.GetHeader("Origin")
+        if _, ok := allowedOrigins[origin]; ok {
+            c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+            c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+            c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Correlation-ID")
+            c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        }
+
+        if c.Request.Method == http.MethodOptions {
+            c.Status(http.StatusNoContent)
+            return
+        }
+
+        if strings.HasPrefix(c.Request.URL.Path, "/api/v1/videos/upload") {
+            if err := validateJWT(c.GetHeader("Authorization"), cfg.Auth.JWTSecret); err != nil {
+                c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+                return
+            }
+        }
+
+        c.Next()
     }
 }
 ```
+
 
 #### Input Validation
-```java
-@Data
-@Builder
-public class VideoMetadataRequest {
-    
-    @NotBlank(message = \"Title is required\")
-    @Size(min = 3, max = 255, message = \"Title must be between 3 and 255 characters\")
-    private String title;
-    
-    @Size(max = 2000, message = \"Description cannot exceed 2000 characters\")
-    private String description;
-    
-    @NotNull(message = \"Uploader ID is required\")
-    private String uploaderId;
+```go
+type VideoMetadataRequest struct {
+    Title      string `form:"title" validate:"required,min=3,max=255"`
+    Description string `form:"description" validate:"max=2000"`
+    UploaderID string `form:"uploaderId" validate:"required,uuid4"`
 }
 
-@Component
-public class VideoValidator {
-    
-    private static final long MAX_FILE_SIZE = 2L * 1024 * 1024 * 1024; // 2GB
-    private static final List<String> ALLOWED_CONTENT_TYPES = Arrays.asList(
-            \"video/mp4\",
-            \"video/mpeg\",
-            \"video/quicktime\",
-            \"video/x-msvideo\",
-            \"video/x-matroska\"
-    );
-    
-    public void validate(MultipartFile file) {
-        if (file.isEmpty()) {
-            throw new InvalidFileException(\"File is empty\");
-        }
-        
-        if (file.getSize() > MAX_FILE_SIZE) {
-            throw new InvalidFileException(\"File size exceeds maximum limit of 2GB\");
-        }
-        
-        String contentType = file.getContentType();
-        if (contentType == null || !ALLOWED_CONTENT_TYPES.contains(contentType)) {
-            throw new InvalidFileException(\"Invalid file type. Only video files are allowed\");
-        }
-        
-        // Additional validation: check file extension
-        String filename = file.getOriginalFilename();
-        if (filename == null || !hasValidExtension(filename)) {
-            throw new InvalidFileException(\"Invalid file extension\");
-        }
-    }
-    
-    private boolean hasValidExtension(String filename) {
-        String extension = filename.substring(filename.lastIndexOf(\".\") + 1).toLowerCase();
-        return Arrays.asList(\"mp4\", \"mpeg\", \"mov\", \"avi\", \"mkv\").contains(extension);
+type VideoValidator struct {
+    validate            *validator.Validate
+    maxFileSize         int64
+    allowedContentTypes map[string]struct{}
+}
+
+func NewVideoValidator() *VideoValidator {
+    return &VideoValidator{
+        validate:    validator.New(),
+        maxFileSize: 2 * 1024 * 1024 * 1024,
+        allowedContentTypes: map[string]struct{}{
+            "video/mp4":        {},
+            "video/mpeg":       {},
+            "video/quicktime":  {},
+            "video/x-msvideo":  {},
+            "video/x-matroska": {},
+        },
     }
 }
+
+func (v *VideoValidator) Validate(file *multipart.FileHeader, metadata VideoMetadataRequest) error {
+    if err := v.validate.Struct(metadata); err != nil {
+        return fmt.Errorf("invalid metadata: %w", err)
+    }
+    if file == nil || file.Size == 0 {
+        return ErrInvalidFile
+    }
+    if file.Size > v.maxFileSize {
+        return fmt.Errorf("file size exceeds maximum limit of 2GB")
+    }
+    return nil
+}
 ```
+
 
 ### 10. Testing Best Practices
 
 #### Unit Tests
-```java
-@SpringBootTest
-@TestPropertySource(locations = \"classpath:application-test.yml\")
-class UploadServiceTest {
-    
-    @MockBean
-    private S3Service s3Service;
-    
-    @MockBean
-    private KafkaProducerService kafkaProducerService;
-    
-    @Autowired
-    private UploadService uploadService;
-    
-    @Test
-    void testSuccessfulUpload() {
-        // Arrange
-        MockMultipartFile file = new MockMultipartFile(
-                \"video\",
-                \"test-video.mp4\",
-                \"video/mp4\",
-                \"test content\".getBytes()
-        );
-        
-        VideoMetadataRequest metadata = VideoMetadataRequest.builder()
-                .title(\"Test Video\")
-                .description(\"Test Description\")
-                .uploaderId(\"user-123\")
-                .build();
-        
-        String expectedS3Url = \"https://s3.amazonaws.com/bucket/video-123.mp4\";
-        when(s3Service.uploadRawVideo(anyString(), any())).thenReturn(expectedS3Url);
-        
-        // Act
-        UploadResponse response = uploadService.processUpload(file, metadata);
-        
-        // Assert
-        assertNotNull(response.getVideoId());
-        assertEquals(\"UPLOADED\", response.getStatus());
-        verify(s3Service, times(1)).uploadRawVideo(anyString(), any());
-        verify(kafkaProducerService, times(1)).sendUploadEvent(any());
+```go
+func TestProcessUpload_Success(t *testing.T) {
+    t.Parallel()
+
+    s3Mock := new(mocks.S3Service)
+    kafkaMock := new(mocks.KafkaProducer)
+    validator := validator.NewVideoValidator()
+    logger := zap.NewNop()
+
+    service := NewUploadService(s3Mock, kafkaMock, validator, logger)
+
+    file := &multipart.FileHeader{Filename: \"test-video.mp4\", Size: 1024}
+    metadata := VideoMetadataRequest{
+        Title:     \"Test Video\",
+        Description: \"Test Description\",
+        UploaderID: \"user-123\",
     }
+
+    s3Mock.On(\"UploadRawVideo\", mock.Anything, mock.Anything, mock.Anything).
+        Return(\"https://s3.amazonaws.com/bucket/video-123.mp4\", nil)
+    kafkaMock.On(\"SendUploadEvent\", mock.Anything, mock.Anything).Return(nil)
+
+    response, err := service.ProcessUpload(context.Background(), file, metadata)
+
+    require.NoError(t, err)
+    require.NotEmpty(t, response.VideoID)
+    require.Equal(t, \"UPLOADED\", response.Status)
+    s3Mock.AssertExpectations(t)
+    kafkaMock.AssertExpectations(t)
 }
 ```
 
 #### Integration Tests
-```java
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@Testcontainers
-@AutoConfigureMockMvc
-class UploadControllerIntegrationTest {
-    
-    @Container
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(\"postgres:15-alpine\")
-            .withDatabaseName(\"testdb\")
-            .withUsername(\"test\")
-            .withPassword(\"test\");
-    
-    @Container
-    static KafkaContainer kafka = new KafkaContainer(
-            DockerImageName.parse(\"confluentinc/cp-kafka:7.5.0\")
-    );
-    
-    @Autowired
-    private MockMvc mockMvc;
-    
-    @DynamicPropertySource
-    static void configureProperties(DynamicPropertyRegistry registry) {
-        registry.add(\"spring.datasource.url\", postgres::getJdbcUrl);
-        registry.add(\"spring.datasource.username\", postgres::getUsername);
-        registry.add(\"spring.datasource.password\", postgres::getPassword);
-        registry.add(\"spring.kafka.bootstrap-servers\", kafka::getBootstrapServers);
+```go
+func TestUploadEndpoint_Integration(t *testing.T) {
+    t.Parallel()
+
+    ctx := context.Background()
+    pgContainer := testcontainers.PostgresContainer(ctx,
+        testcontainers.WithDatabase(\"testdb\"),
+        testcontainers.WithUsername(\"test\"),
+        testcontainers.WithPassword(\"test\"),
+    )
+    kafkaContainer := testcontainers.KafkaContainer(ctx)
+    t.Cleanup(func() {
+        _ = pgContainer.Terminate(ctx)
+        _ = kafkaContainer.Terminate(ctx)
+    })
+
+    cfg := config.Config{
+        DatabaseURL:      pgContainer.ConnectionString(ctx),
+        KafkaBrokers:     []string{kafkaContainer.BootstrapServers(ctx)},
+        HTTPPort:         8081,
     }
-    
-    @Test
-    void testUploadEndpoint() throws Exception {
-        MockMultipartFile file = new MockMultipartFile(
-                \"file\",
-                \"test.mp4\",
-                \"video/mp4\",
-                \"video content\".getBytes()
-        );
-        
-        mockMvc.perform(multipart(\"/api/v1/videos/upload\")
-                .file(file)
-                .param(\"title\", \"Test Video\")
-                .param(\"uploaderId\", \"user-123\"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath(\"$.videoId\").exists())
-                .andExpect(jsonPath(\"$.status\").value(\"UPLOADED\"));
-    }
+
+    router := bootstrapTestServer(t, cfg)
+
+    body := &bytes.Buffer{}
+    writer := multipart.NewWriter(body)
+    part, _ := writer.CreateFormFile(\"file\", \"test.mp4\")
+    _, _ = part.Write([]byte(\"video content\"))
+    _ = writer.WriteField(\"title\", \"Test Video\")
+    _ = writer.WriteField(\"uploaderId\", \"user-123\")
+    _ = writer.Close()
+
+    req := httptest.NewRequest(http.MethodPost, \"/api/v1/videos/upload\", body)
+    req.Header.Set(\"Content-Type\", writer.FormDataContentType())
+    rec := httptest.NewRecorder()
+
+    router.ServeHTTP(rec, req)
+    require.Equal(t, http.StatusOK, rec.Code)
+    require.Contains(t, rec.Body.String(), \"videoId\")
+    require.Contains(t, rec.Body.String(), \"UPLOADED\")
 }
 ```
 
@@ -2120,12 +1845,9 @@ export default function UploadPage() {
 
 1. **Prerequisites Installation**
 ```bash
-# Install Java 21
-sdk install java 21.0.1-tem
-
-# Install Maven
-brew install maven  # macOS
-# or download from https://maven.apache.org/
+# Install Go
+brew install go  # macOS
+# Ubuntu: sudo apt install golang-go
 
 # Install Node.js and npm
 nvm install 20
@@ -2145,29 +1867,30 @@ sudo apt install ffmpeg  # Ubuntu
 git clone <your-repo-url>
 cd videovault
 
-# Start infrastructure services
-docker-compose up -d kafka zookeeper postgres localstack
+# Start infrastructure (Kafka + Postgres required; LocalStack/MinIO only if you test S3-compatible code)
+docker-compose up -d kafka zookeeper postgres
+
+# With STORAGE_BACKEND=local, ensure STORAGE_LOCAL_ROOT exists (e.g. mkdir -p .data/storage)
+# Optional: add localstack or minio to compose and run ./scripts/init-s3.sh / init-minio.sh
 
 # Wait for services to be ready
 ./scripts/wait-for-services.sh
-
-# Initialize S3 buckets
-./scripts/init-s3.sh
 ```
 
 3. **Build and Run Backend Services**
 ```bash
 # Build all services
 cd backend
-mvn clean install
+go work sync
+go build ./...
 
 # Run services individually (in separate terminals)
-cd upload-service && mvn spring-boot:run
-cd encoder-service && mvn spring-boot:run -Dspring-boot.run.arguments=\"--encoding.quality=1080p\"
-cd encoder-service && mvn spring-boot:run -Dspring-boot.run.arguments=\"--encoding.quality=720p\"
-cd encoder-service && mvn spring-boot:run -Dspring-boot.run.arguments=\"--encoding.quality=480p\"
-cd metadata-service && mvn spring-boot:run
-cd streaming-service && mvn spring-boot:run
+cd upload-service && go run ./cmd/upload-service
+cd encoder-service && ENCODING_QUALITY=1080p go run ./cmd/encoder-service
+cd encoder-service && ENCODING_QUALITY=720p go run ./cmd/encoder-service
+cd encoder-service && ENCODING_QUALITY=480p go run ./cmd/encoder-service
+cd metadata-service && go run ./cmd/metadata-service
+cd streaming-service && go run ./cmd/streaming-service
 ```
 
 4. **Run Frontend**
@@ -2238,7 +1961,7 @@ spec:
         ports:
         - containerPort: 8080
         env:
-        - name: SPRING_PROFILES_ACTIVE
+        - name: APP_ENV
           value: \"prod\"
         - name: KAFKA_BOOTSTRAP_SERVERS
           value: \"kafka-service:9092\"
@@ -2261,13 +1984,13 @@ spec:
             cpu: \"2000m\"
         livenessProbe:
           httpGet:
-            path: /actuator/health/liveness
+            path: /healthz
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /actuator/health/readiness
+            path: /readyz
             port: 8080
           initialDelaySeconds: 20
           periodSeconds: 5
@@ -2279,35 +2002,34 @@ spec:
 
 1. **Database Connection Pooling**
 ```yaml
-spring:
-  datasource:
-    hikari:
-      maximum-pool-size: 20
-      minimum-idle: 5
-      connection-timeout: 30000
-      idle-timeout: 600000
-      max-lifetime: 1800000
+database:
+  max_open_conns: 20
+  max_idle_conns: 5
+  conn_max_idle_time: 10m
+  conn_max_lifetime: 30m
 ```
 
 2. **Kafka Producer Batching**
 ```yaml
-spring:
-  kafka:
-    producer:
-      batch-size: 16384
-      linger-ms: 10
-      compression-type: snappy
+kafka:
+  producer:
+    batch_size: 16384
+    linger_ms: 10
+    compression_type: snappy
 ```
 
 3. **S3 Transfer Optimization**
-```java
-// Use TransferManager for large files
-TransferManager transferManager = TransferManagerBuilder
-    .standard()
-    .withS3Client(s3Client)
-    .withMinimumUploadPartSize(10L * 1024 * 1024) // 10MB
-    .withMultipartUploadThreshold(20L * 1024 * 1024) // 20MB
-    .build();
+```go
+uploader := manager.NewUploader(s3Client, func(u *manager.Uploader) {
+    u.PartSize = 10 * 1024 * 1024 // 10MB
+    u.Concurrency = 4
+})
+
+_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+    Bucket: aws.String(bucketName),
+    Key:    aws.String(key),
+    Body:   file,
+})
 ```
 
 4. **FFmpeg Encoding Optimization**
@@ -2357,7 +2079,7 @@ ffmpeg -hwaccel videotoolbox -i input.mp4 ...  # macOS
 ## Additional Resources & Documentation
 
 ### Official Documentation
-- Spring Boot: https://spring.io/projects/spring-boot
+- Go: https://go.dev/doc/
 - Apache Kafka: https://kafka.apache.org/documentation/
 - gRPC: https://grpc.io/docs/
 - FFmpeg: https://ffmpeg.org/documentation.html
@@ -2375,7 +2097,7 @@ ffmpeg -hwaccel videotoolbox -i input.mp4 ...  # macOS
 - kafkacat/kcat for Kafka debugging
 - pgAdmin for PostgreSQL management
 - Docker Desktop for container management
-- IntelliJ IDEA or VS Code for development
+- GoLand or VS Code for development
 
 ---
 
@@ -2386,9 +2108,11 @@ ffmpeg -hwaccel videotoolbox -i input.mp4 ...  # macOS
 3. **Monitor from day one** - Add logging and metrics from the start
 4. **Document as you go** - Update README and docs with each feature
 5. **Security is not optional** - Implement authentication, validation, and encryption
-6. **Think about scale** - Design for horizontal scaling even if you start small
-7. **Handle failures gracefully** - Network calls fail, services crash, plan for it
-8. **Keep it simple** - Don't over-engineer, solve the problem at hand
+6. **Object storage: local-first** - Default `STORAGE_BACKEND=local`; shared `BlobStore` interface; only enable Supabase (or other remote) when you intentionally flip config — **never** depend on the internet for routine development
+7. **Think about scale in the architecture, not the bill** - Use patterns that *could* scale (Kafka, stateless services), but this repo’s **stated goal** is learning and a **small personal demo**, not hyperscale traffic
+8. **Handle failures gracefully** - Network calls fail, services crash, plan for it
+9. **Keep it simple** - Don't over-engineer, solve the problem at hand
+10. **Videos and images share storage** - Same `BlobStore`; branch processing by asset type
 
 ---
 
@@ -2404,6 +2128,8 @@ ffmpeg -hwaccel videotoolbox -i input.mp4 ...  # macOS
 8. **Skipping input validation** - Security and data integrity nightmare
 9. **Not testing with realistic file sizes** - 10MB test files don't represent 2GB uploads
 10. **Forgetting about CORS** - Frontend won't be able to make API calls
+11. **Leaking remote storage into default dev** - Hardcoding Supabase or AWS clients in services instead of `BlobStore` forces every contributor online; keep **local** the default path
+12. **Duplicating object paths** - Put key naming (`raw/…`, `images/originals/…`) in **one** shared package so upload, encoder, and streaming never drift
 
 ---
 
