@@ -130,3 +130,57 @@ flowchart TB
 ### Frontend
 
 - **Next.js**: upload UI, library, player (when wired)
+
+## Week 1 Starter Setup
+
+This repository now includes a Week 1 learning-first starter for the `upload-service`:
+
+- `services/upload-service`: Go API with `/healthz`, `/readyz`, and upload/status endpoints
+- `docker-compose.yml`: local Kafka, Kafka UI, PostgreSQL, and upload-service
+- YAML config with env override support (`viper`) for future extensibility
+
+### Prerequisites
+
+- Go 1.22+
+- Docker + Docker Compose
+- `make` (optional, but convenient)
+
+### Install Dependencies
+
+```bash
+cd services/upload-service
+go mod tidy
+```
+
+### Run Locally (without Docker)
+
+```bash
+cd services/upload-service
+make run
+```
+
+### Run Full Local Stack (with Docker)
+
+```bash
+docker compose up --build
+```
+
+Useful local URLs:
+
+- Upload service: `http://localhost:8080`
+- Kafka UI: `http://localhost:8081`
+- Postgres: `localhost:5432` (`videovault` / `videovault`)
+
+### Quick API Smoke Test
+
+```bash
+curl -X POST http://localhost:8080/api/v1/videos/upload \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Week 1 upload", "description":"learning flow", "filename":"intro.mp4"}'
+```
+
+Then query status:
+
+```bash
+curl http://localhost:8080/api/v1/videos/upload/status/<videoId>
+```

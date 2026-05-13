@@ -1,0 +1,30 @@
+service:
+  name: upload-service
+  env: dev
+
+server:
+  port: "8080"
+
+log:
+  level: info
+
+# Future extensibility (Week 2+):
+# kafka:
+#   brokers:
+#     - localhost:9092
+#   topics:
+#     uploadedVideos: uploaded-videos
+#
+# postgres:
+#   host: localhost
+#   port: 5432
+#   user: videovault
+#   dbName: videovault
+#
+# storage:
+#   backend: local # local | supabase
+#   local:
+#     baseDir: ./data/objectstore
+#   supabase:
+#     projectUrl: https://<project-ref>.supabase.co
+#     bucket: videos

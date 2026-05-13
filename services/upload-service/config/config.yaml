@@ -1,0 +1,9 @@
+service:
+  name: upload-service
+  env: dev
+
+server:
+  port: "8080"
+
+log:
+  level: info
